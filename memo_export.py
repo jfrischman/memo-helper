@@ -9,7 +9,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.shared import Pt
 
 from native_charts import update_native_pies
 
@@ -17,33 +17,6 @@ from native_charts import update_native_pies
 PROJECT_BALANCE_TEMPLATE = Path(
     r"C:\Users\jfrischman\OneDrive - GCM Grosvenor\Credit\Credit Secondaries\1. Investments\1. IC Approved & Closed Transactions\Project Balance\Project Balance IC Memo v1.docx"
 )
-
-
-ASSET_CLASS_COLORS = {
-    "Corporate Lending": "#1f5f74",
-    "ABS": "#8b5e3c",
-    "Special Situations": "#5d7d4e",
-}
-GEOGRAPHY_COLORS = {
-    "North America": "#4f6fb5",
-    "Europe": "#c27c3d",
-    "Other": "#8a4f69",
-}
-DEFAULT_COLORS = ["#1f5f74", "#8b5e3c", "#5d7d4e", "#4f6fb5", "#c27c3d", "#8a4f69", "#6d7a8a"]
-
-
-def _font(size: int, bold: bool = False):
-    candidates = [
-        Path(r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf"),
-        Path(r"C:\Windows\Fonts\calibri.ttf"),
-    ]
-    for path in candidates:
-        if path.exists():
-            try:
-                return ImageFont.truetype(str(path), size=size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
 
 
 def _fmt_pct(value: float) -> str:
@@ -95,20 +68,6 @@ def _insert_table_after(paragraph, rows: int, cols: int):
     return table
 
 
-def _image_fill(color: str):
-    color = color.lstrip("#")
-    return tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
-
-
-def _resolve_color(family: str, label: str, index: int) -> str:
-    if family == "geography":
-        return GEOGRAPHY_COLORS.get(label, DEFAULT_COLORS[index % len(DEFAULT_COLORS)])
-    asset_class = label
-    if family in {"security_type", "sub_asset_class"}:
-        asset_class = _ASSET_CLASS_FOR_SECURITY_TYPE(label)
-    return ASSET_CLASS_COLORS.get(asset_class, DEFAULT_COLORS[index % len(DEFAULT_COLORS)])
-
-
 def _ASSET_CLASS_FOR_SECURITY_TYPE(label: str) -> str:
     mapping = {
         "Direct Lending": "Corporate Lending",
@@ -128,55 +87,6 @@ def _ASSET_CLASS_FOR_SECURITY_TYPE(label: str) -> str:
         "Equity": "Special Situations",
     }
     return mapping.get(label, "")
-
-
-def _top_items(items: Sequence[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:
-    ordered = sorted(items, key=lambda item: float(item.get("value") or item.get("percentage") or 0), reverse=True)
-    if len(ordered) <= limit:
-        return list(ordered)
-    head = list(ordered[: limit - 1])
-    other_value = sum(float(item.get("value") or item.get("percentage") or 0) for item in ordered[limit - 1 :])
-    head.append({"label": "Other", "value": other_value, "percentage": other_value})
-    return head
-
-
-def _draw_donut_chart(title: str, items: Sequence[Dict[str, Any]], family: str, out_path: Path, width: int = 1400, height: int = 580):
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    title_font = _font(28, bold=True)
-    body_font = _font(22)
-    small_font = _font(18)
-    draw.text((40, 24), title, fill="#1f2937", font=title_font)
-
-    chart_box = (40, 90, 420, 470)
-    cx = (chart_box[0] + chart_box[2]) // 2
-    cy = (chart_box[1] + chart_box[3]) // 2
-    radius = 160
-    inner = 88
-    total = sum(float(item.get("value") or item.get("percentage") or 0) for item in items) or 1.0
-    angle = -90.0
-    for idx, item in enumerate(items):
-        value = float(item.get("value") or item.get("percentage") or 0)
-        sweep = 360.0 * value / total
-        color = _resolve_color(family, str(item.get("label") or ""), idx)
-        draw.pieslice((cx - radius, cy - radius, cx + radius, cy + radius), start=angle, end=angle + sweep, fill=_image_fill(color))
-        angle += sweep
-    draw.ellipse((cx - inner, cy - inner, cx + inner, cy + inner), fill="white")
-
-    legend_x = 500
-    legend_y = 110
-    legend_line_h = 60
-    for idx, item in enumerate(items):
-        y = legend_y + idx * legend_line_h
-        color = _resolve_color(family, str(item.get("label") or ""), idx)
-        draw.rectangle((legend_x, y + 6, legend_x + 24, y + 30), fill=_image_fill(color))
-        label = str(item.get("label") or "")
-        pct = _fmt_pct(float(item.get("value") or item.get("percentage") or 0))
-        draw.text((legend_x + 36, y), label, fill="#1f2937", font=body_font)
-        draw.text((legend_x + 36, y + 28), pct, fill="#6b7280", font=small_font)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out_path)
 
 
 def _compute_top_concentration(items: Sequence[Dict[str, Any]]) -> Dict[str, float]:
