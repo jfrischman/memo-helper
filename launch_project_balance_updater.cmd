@@ -1,12 +1,3 @@
 @echo off
-setlocal
-set "APPDIR=%~dp0"
-set "PYTHON=py"
-set "URL=http://127.0.0.1:8799/"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "try { $r = Invoke-WebRequest -UseBasicParsing -Uri '%URL%' -TimeoutSec 2; if ($r.StatusCode -eq 200) { Start-Process '%URL%'; exit 0 } } catch {}"
-
-start "" /b "%PYTHON%" "%APPDIR%app.py"
-timeout /t 2 /nobreak >nul
-start "" "%URL%"
+REM Restart the app with the latest code and open it in the browser.
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0launch_project_balance_updater.ps1"
