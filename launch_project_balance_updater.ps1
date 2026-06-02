@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = 'C:\Users\jfrischman\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+$python = 'py'
 $url = 'http://127.0.0.1:8799/'
 
 try {

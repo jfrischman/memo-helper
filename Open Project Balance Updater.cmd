@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "APPDIR=%~dp0"
-set "PYTHON=C:\Users\jfrischman\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+set "PYTHON=py"
 set "URL=http://127.0.0.1:8799/"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
