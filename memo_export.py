@@ -7,9 +7,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Inches, Pt
 
 from native_charts import update_native_pies
 
@@ -21,6 +22,10 @@ PROJECT_BALANCE_TEMPLATE = Path(
 
 def _fmt_pct(value: float) -> str:
     return f"{value * 100:.1f}%"
+
+
+def _fmt_pct0(value: float) -> str:
+    return f"{value * 100:.0f}%"
 
 
 def _fmt_money(value: float) -> str:
@@ -41,8 +46,41 @@ def _set_cell_text(cell, text: str, align: Optional[WD_ALIGN_PARAGRAPH] = None):
         if align is not None:
             p.alignment = align
         for run in p.runs:
-            run.font.name = "Arial"
-            run.font.size = Pt(9)
+            run.font.name = "Calibri"
+            run.font.size = Pt(8)
+
+
+def _set_cell_no_wrap(cell):
+    """Tell Word not to wrap this cell's text (keeps a label on one line)."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    for el in tcPr.findall(qn("w:noWrap")):
+        tcPr.remove(el)
+    tcPr.append(OxmlElement("w:noWrap"))
+
+
+def _format_table(table, center_from_col: int, font_pt: int = 8,
+                  wide_col: Optional[int] = None, wide_width_in: float = 1.9):
+    """
+    Apply uniform formatting to ALL rows of a table (so new sub-asset-class rows
+    inherit it on every rebuild):
+      - Calibri `font_pt` on every cell;
+      - columns >= center_from_col: horizontally centered + vertically middle;
+      - `wide_col` (if given): widened + no-wrap so its labels stay on one line.
+    """
+    for row in table.rows:
+        cells = row.cells
+        for ci, cell in enumerate(cells):
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.font.name = "Calibri"
+                    run.font.size = Pt(font_pt)
+            if ci >= center_from_col:
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            if wide_col is not None and ci == wide_col:
+                cell.width = Inches(wide_width_in)
+                _set_cell_no_wrap(cell)
 
 
 def _clear_paragraph(paragraph):
@@ -139,7 +177,7 @@ def _table3_rows(result: Dict[str, Any]) -> List[List[str]]:
         profiles = fund_profiles[fund_index].get("categories") if fund_index < len(fund_profiles) else {}
         fam = profiles.get(family, [])
         mapping = {item["label"]: float(item["value"] or item["percentage"] or 0) for item in fam}
-        return _fmt_pct(mapping.get(label, 0.0))
+        return _fmt_pct0(mapping.get(label, 0.0))
 
     corporate_rows = sorted(
         [label for label in subasset.keys() if label and "equity" not in label.lower() or label in subasset],
@@ -152,14 +190,14 @@ def _table3_rows(result: Dict[str, Any]) -> List[List[str]]:
     special_top = special_rows[:1] if special_rows else ["Equity"]
 
     rows = [
-        ["LP NAV", "", "100%", *[_fmt_pct(w) for w in fund_weight_pcts]],
-        ["Corporate Lending", "", _fmt_pct(asset.get("Corporate Lending", 0.0)), *[fund_pct(i, "Corporate Lending", "asset_class") for i in range(len(fund_profiles))]],
+        ["LP NAV", "", "100%", *[_fmt_pct0(w) for w in fund_weight_pcts]],
+        ["Corporate Lending", "", _fmt_pct0(asset.get("Corporate Lending", 0.0)), *[fund_pct(i, "Corporate Lending", "asset_class") for i in range(len(fund_profiles))]],
     ]
     for label in corp_top:
-        rows.append(["Corporate Lending", label, _fmt_pct(subasset.get(label, 0.0)), *[fund_pct(i, label, "sub_asset_class") for i in range(len(fund_profiles))]])
-    rows.append(["Special Situations", "", _fmt_pct(asset.get("Special Situations", 0.0)), *[fund_pct(i, "Special Situations", "asset_class") for i in range(len(fund_profiles))]])
+        rows.append(["Corporate Lending", label, _fmt_pct0(subasset.get(label, 0.0)), *[fund_pct(i, label, "sub_asset_class") for i in range(len(fund_profiles))]])
+    rows.append(["Special Situations", "", _fmt_pct0(asset.get("Special Situations", 0.0)), *[fund_pct(i, "Special Situations", "asset_class") for i in range(len(fund_profiles))]])
     for label in special_top:
-        rows.append(["Special Situations", label, _fmt_pct(subasset.get(label, 0.0)), *[fund_pct(i, label, "sub_asset_class") for i in range(len(fund_profiles))]])
+        rows.append(["Special Situations", label, _fmt_pct0(subasset.get(label, 0.0)), *[fund_pct(i, label, "sub_asset_class") for i in range(len(fund_profiles))]])
     return rows
 
 
@@ -195,6 +233,13 @@ def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_pa
         for idx, row_values in enumerate(table3, start=1):
             if idx < len(doc.tables[3].rows):
                 _clear_and_set_table_row(doc.tables[3].rows[idx], row_values)
+
+        # Formatting (applied to all rows so new categories inherit it):
+        #  - concentration table: Calibri 8; columns 2-6 centered + middle.
+        _format_table(doc.tables[2], center_from_col=1)
+        #  - asset-type-by-fund: Calibri 8; columns 3-6 centered + middle;
+        #    column 2 (sub-asset class) widened + no-wrap to stay on one line.
+        _format_table(doc.tables[3], center_from_col=2, wide_col=1)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))

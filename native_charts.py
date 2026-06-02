@@ -63,29 +63,90 @@ def _blend_lookup(items: Sequence[Dict[str, Any]]) -> Dict[str, float]:
 
 def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
                       label_fmt: Callable[[str, float], str]) -> tuple[bytes, List[str]]:
+    """
+    Map the blend onto the pie's existing category slots by name, then:
+      - drop any category whose value is *legitimately 0* (slice + its dPt color +
+        its dLbl label are removed; surviving slices are re-indexed so they keep
+        their original colors and label positions);
+      - keep categories with value > 0 even if they round to 0% (label shows "(0%)").
+    """
     lookup = _blend_lookup(items)
     root = etree.fromstring(xml_bytes)
     ser = root.find(".//c:ser", NS)
     if ser is None:
         return xml_bytes, ["no <c:ser>"]
 
-    cat_pts = ser.findall(".//c:cat//c:strCache/c:pt", NS)
-    val_pts = ser.findall(".//c:val//c:numCache/c:pt", NS)
-    notes: List[str] = []
+    cat_cache = ser.find(".//c:cat//c:strCache", NS)
+    val_cache = ser.find(".//c:val//c:numCache", NS)
+    if cat_cache is None or val_cache is None:
+        return xml_bytes, ["no cache"]
+    cat_pts = cat_cache.findall("c:pt", NS)
+    val_pts = val_cache.findall("c:pt", NS)
+    dlbls = ser.find("c:dLbls", NS)
 
-    for i, cat_pt in enumerate(cat_pts):
-        cat_v = cat_pt.find("c:v", NS)
-        base = base_label(cat_v.text if cat_v is not None else "")
+    notes: List[str] = []
+    keep: List[tuple[int, str, float]] = []   # (orig_idx, base_label, share)
+    for i, cp in enumerate(cat_pts):
+        cv = cp.find("c:v", NS)
+        base = base_label(cv.text if cv is not None else "")
         share = lookup.get(base.lower(), 0.0)
-        # value
+        if share > 0:
+            keep.append((i, base, share))
+            notes.append(f"{base}={share:.1%}")
+        else:
+            notes.append(f"{base}=drop(0)")
+
+    drop_set = {i for i in range(len(cat_pts)) if i not in {oi for oi, _, _ in keep}}
+    orig_to_new = {oi: new for new, (oi, _, _) in enumerate(keep)}
+
+    # remove dropped category / value points
+    for i in sorted(drop_set, reverse=True):
+        cat_cache.remove(cat_pts[i])
         if i < len(val_pts):
-            val_v = val_pts[i].find("c:v", NS)
-            if val_v is not None:
-                val_v.text = repr(float(share))
-        # label
-        if cat_v is not None:
-            cat_v.text = label_fmt(base, share)
-        notes.append(f"{base}={share:.1%}")
+            val_cache.remove(val_pts[i])
+
+    # fix ptCount
+    for cache in (cat_cache, val_cache):
+        pc = cache.find("c:ptCount", NS)
+        if pc is not None:
+            pc.set("val", str(len(keep)))
+
+    # rewrite values + labels and re-index surviving points (now in keep order)
+    new_cat_pts = cat_cache.findall("c:pt", NS)
+    new_val_pts = val_cache.findall("c:pt", NS)
+    for new_i, (oi, base, share) in enumerate(keep):
+        cp = new_cat_pts[new_i]
+        cp.set("idx", str(new_i))
+        cv = cp.find("c:v", NS)
+        if cv is not None:
+            cv.text = label_fmt(base, share)
+        if new_i < len(new_val_pts):
+            vp = new_val_pts[new_i]
+            vp.set("idx", str(new_i))
+            vv = vp.find("c:v", NS)
+            if vv is not None:
+                vv.text = repr(float(share))
+
+    # drop dropped slices' colors/labels; re-index survivors to match
+    for dp in list(ser.findall("c:dPt", NS)):
+        ie = dp.find("c:idx", NS)
+        if ie is None:
+            continue
+        oi = int(ie.get("val"))
+        if oi in drop_set:
+            ser.remove(dp)
+        elif oi in orig_to_new:
+            ie.set("val", str(orig_to_new[oi]))
+    if dlbls is not None:
+        for dl in list(dlbls.findall("c:dLbl", NS)):
+            ie = dl.find("c:idx", NS)
+            if ie is None:
+                continue
+            oi = int(ie.get("val"))
+            if oi in drop_set:
+                dlbls.remove(dl)
+            elif oi in orig_to_new:
+                ie.set("val", str(orig_to_new[oi]))
 
     new_bytes = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
     return new_bytes, notes
