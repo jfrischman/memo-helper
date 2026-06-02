@@ -1,0 +1,14 @@
+# runtime / generated
+__pycache__/
+*.pyc
+memo_projects/
+_charts/
+render_balance/
+_live_app.html
+*_stdout.log
+*_stderr.log
+restart_out.log
+restart_err.log
+
+# large source docs (keep out of git; they live on OneDrive)
+source_docs/
