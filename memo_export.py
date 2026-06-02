@@ -10,7 +10,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
-from PIL import Image, ImageDraw, ImageFont
+
+from native_charts import update_native_pies
 
 
 PROJECT_BALANCE_TEMPLATE = Path(
@@ -285,30 +286,12 @@ def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_pa
             if idx < len(doc.tables[3].rows):
                 _clear_and_set_table_row(doc.tables[3].rows[idx], row_values)
 
-    # Insert refreshed charts after the exposure summary table.
-    if len(doc.tables) >= 4:
-        anchor = doc.tables[3]
-        after = anchor._tbl
-        chart_specs = [
-            ("Asset Class Exposure", result.get("categories", {}).get("asset_class", []), "asset_class"),
-            ("Security Type Exposure", result.get("categories", {}).get("security_type", []), "security_type"),
-            ("Geography Exposure", result.get("categories", {}).get("geography", []), "geography"),
-        ]
-        chart_dir = output_path.parent / "_charts"
-        chart_dir.mkdir(parents=True, exist_ok=True)
-        for idx, (title, items, family) in enumerate(chart_specs, start=1):
-            img_path = chart_dir / f"{idx}_{family}.png"
-            _draw_donut_chart(title, _top_items(items), family, img_path)
-            p = OxmlElement("w:p")
-            after.addnext(p)
-            from docx.text.paragraph import Paragraph
-
-            para = Paragraph(p, doc._body)
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = para.add_run()
-            run.add_picture(str(img_path), width=Inches(6.5))
-            after = p
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
+
+    # Update the memo's *native* exposure pies in place (asset class / security
+    # type / geography). python-docx cannot edit chart XML, so this runs on the
+    # saved package, rewriting the chart caches. Preserves the memo's chart
+    # styling instead of appending flat PNG images.
+    update_native_pies(output_path, result.get("categories", {}) or {})
     return output_path
