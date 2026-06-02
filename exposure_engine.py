@@ -599,20 +599,42 @@ def _compute_fund_profile(
     return out
 
 
+def _manual_fund_profile(manual_families: Dict[str, List[Tuple[str, float]]]) -> Dict[str, Any]:
+    """Profile for a fund with no workbook: categories come straight from the manual
+    overrides (asset class / security type / geography). No positions or NAV."""
+    out: Dict[str, Any] = {"total_nav": 0.0, "positions": 0, "position_exposure": [], "categories": {}, "cash_rows": 0}
+    for family in ["asset_class", "security_type", "geography", "sub_asset_class"]:
+        if family in manual_families:
+            out["categories"][family] = _build_manual_category_breakdown(manual_families[family])
+    if "sub_asset_class" not in out["categories"] and "security_type" in out["categories"]:
+        out["categories"]["sub_asset_class"] = list(out["categories"]["security_type"])
+    return out
+
+
 def compute_project_exposure(
     funds: List[Dict[str, Any]],
     uploads: Dict[str, Dict[str, Any]],
     normalization_rules: Dict[str, str],
 ) -> Dict[str, Any]:
     if not funds:
-        raise ValueError("Add at least one fund workbook before calculating exposures")
+        raise ValueError("Add at least one fund before calculating exposures")
 
-    total_bid = 0.0
+    # A fund is usable if it has an imported workbook OR manual exposure overrides.
+    # Funds with neither (e.g. just added, not yet imported) are skipped, and weights
+    # are normalized across the funds that actually carry composition data.
+    prepared: List[tuple] = []
     for fund in funds:
+        upload_id = fund.get("upload_id")
+        manual_families = parse_manual_overrides(fund.get("manual_category_overrides") or "")
+        has_wb = bool(upload_id and upload_id in uploads)
         bid = float(fund.get("bid_amount") or 0.0)
         if bid < 0:
-            raise ValueError(f"Bid amount must be non-negative for fund {fund.get('filename')}")
-        total_bid += bid
+            raise ValueError(f"Bid amount must be non-negative for fund {fund.get('fund_name') or fund.get('filename')}")
+        if has_wb or manual_families:
+            prepared.append((fund, has_wb, manual_families, bid))
+    if not prepared:
+        raise ValueError("Add at least one fund with an imported workbook or manual exposures.")
+    total_bid = sum(b for _, _, _, b in prepared)
     if total_bid <= 0:
         raise ValueError("Total bid amount must be greater than zero")
 
@@ -621,54 +643,40 @@ def compute_project_exposure(
     project_categories: Dict[str, Dict[str, float]] = {}
     project_positions: Dict[str, float] = {}
 
-    for fund in funds:
-        upload_id = fund.get("upload_id")
-        if upload_id not in uploads:
-            raise ValueError(f"Upload {upload_id} is no longer available")
-        upload = uploads[upload_id]
-        sheet_name = fund.get("sheet_name") or upload["default_sheet"]
-        header_mode = fund.get("header_mode") or upload.get("header_mode") or "auto"
-        df = read_sheet_dataframe(upload["data"], sheet_name, header_mode=header_mode)
-
-        bid = float(fund.get("bid_amount") or 0.0)
+    for fund, has_wb, manual_families, bid in prepared:
         weight = bid / total_bid
         column_map = fund.get("column_map") or {}
         if not column_map.get("sub_asset_class") and column_map.get("security_type"):
             column_map["sub_asset_class"] = column_map.get("security_type")
-        manual_families = parse_manual_overrides(fund.get("manual_category_overrides") or "")
-        profile = _compute_fund_profile(df, weight, normalization_rules, column_map, manual_families)
-        fund_profiles.append(
-            {
-                "fund_name": fund.get("fund_name") or upload["filename"],
-                "filename": upload["filename"],
-                "sheet_name": sheet_name,
-                "header_mode": header_mode,
-                "bid_amount": bid,
-                "weight": weight,
-                "total_nav": profile["total_nav"],
-                "normalized_nav": profile["total_nav"],
-                "positions": profile["positions"],
-                "cash_rows": profile.get("cash_rows", 0),
-                "manual_category_overrides": fund.get("manual_category_overrides") or "",
-                "categories": profile.get("categories") or {},
-                "position_exposure": profile.get("position_exposure") or [],
-            }
-        )
-        fund_rows.append(
-            {
-                "fund_name": fund.get("fund_name") or upload["filename"],
-                "filename": upload["filename"],
-                "sheet_name": sheet_name,
-                "header_mode": header_mode,
-                "bid_amount": bid,
-                "weight": weight,
-                "total_nav": profile["total_nav"],
-                "normalized_nav": profile["total_nav"],
-                "positions": profile["positions"],
-                "cash_rows": profile.get("cash_rows", 0),
-                "manual_category_overrides": fund.get("manual_category_overrides") or "",
-            }
-        )
+
+        if has_wb:
+            upload = uploads[fund["upload_id"]]
+            sheet_name = fund.get("sheet_name") or upload["default_sheet"]
+            header_mode = fund.get("header_mode") or upload.get("header_mode") or "auto"
+            df = read_sheet_dataframe(upload["data"], sheet_name, header_mode=header_mode)
+            profile = _compute_fund_profile(df, weight, normalization_rules, column_map, manual_families)
+            filename = upload["filename"]
+        else:
+            sheet_name = ""
+            header_mode = fund.get("header_mode") or "auto"
+            profile = _manual_fund_profile(manual_families)
+            filename = fund.get("filename") or ""
+
+        common = {
+            "fund_name": fund.get("fund_name") or filename or "Untitled fund",
+            "filename": filename,
+            "sheet_name": sheet_name,
+            "header_mode": header_mode,
+            "bid_amount": bid,
+            "weight": weight,
+            "total_nav": profile["total_nav"],
+            "normalized_nav": profile["total_nav"],
+            "positions": profile["positions"],
+            "cash_rows": profile.get("cash_rows", 0),
+            "manual_category_overrides": fund.get("manual_category_overrides") or "",
+        }
+        fund_profiles.append({**common, "categories": profile.get("categories") or {}, "position_exposure": profile.get("position_exposure") or []})
+        fund_rows.append(dict(common))
 
         for family, breakdown in profile["categories"].items():
             family_bucket = project_categories.setdefault(family, {})

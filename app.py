@@ -18,7 +18,7 @@ from exposure_engine import (
     parse_mapping_rules,
     read_workbook_metadata,
 )
-from memo_export import build_memo_export
+from memo_export import build_memo_export, update_sections_in_file
 from project_store import (
     create_project,
     list_project_summaries,
@@ -400,7 +400,8 @@ HTML = r"""<!DOCTYPE html>
         <div class="toolbar">
           <button class="btn secondary" id="newProjectBtn">Start new project</button>
           <button class="btn" id="saveProjectBtn">Save project</button>
-          <button class="btn primary" id="exportMemoBtn">Export memo</button>
+          <button class="btn primary" id="updateExposuresBtn">Update Exposures</button>
+          <button class="btn" id="exportMemoBtn">Export memo</button>
         </div>
       </div>
       <div class="panel-body">
@@ -420,8 +421,11 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div class="mapping-grid section-gap" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
           <div class="field">
-            <label for="memoFileInput">Attach memo file</label>
-            <input type="file" id="memoFileInput" accept=".docx,.doc,.pdf" />
+            <label for="memoPathInput">Memo file (SharePoint / OneDrive synced path)</label>
+            <div style="display:flex; gap:8px;">
+              <input type="text" id="memoPathInput" placeholder="C:\Users\...\OneDrive - GCM Grosvenor\...\Project X IC Memo.docx" style="flex:1;" />
+              <button class="btn" id="browseMemoBtn" type="button">Browse…</button>
+            </div>
           </div>
           <div class="field">
             <label for="projectStatus">Status</label>
@@ -433,21 +437,16 @@ HTML = r"""<!DOCTYPE html>
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Load Funds</h2>
+        <h2>Funds</h2>
         <div class="toolbar">
-          <label class="btn secondary" for="fileInput" style="display:inline-flex;align-items:center;gap:8px;">
-            <span>Choose workbooks</span>
-          </label>
-          <input id="fileInput" type="file" accept=".xlsx,.xlsm" multiple style="display:none" />
-          <button class="btn primary" id="loadBtn">Load into app</button>
+          <button class="btn primary" id="addFundBtn">Add fund</button>
           <button class="btn" id="clearBtn">Clear</button>
         </div>
       </div>
       <div class="panel-body">
         <div class="small-note">
-          The app expects the first row of each sheet to be headers. If a workbook has multiple sheets,
-          use the sheet selector on each fund card.
-          Excel workbooks should be `.xlsx` or `.xlsm`.
+          Add a fund, then (optionally) import its holdings workbook within the fund card. A fund without a
+          workbook can still contribute via its manual category mix. Imported sheets are expected to have a header row.
         </div>
         <div id="errorBox" class="error section-gap"></div>
         <div id="fundList" class="grid section-gap"></div>
@@ -497,7 +496,16 @@ HTML = r"""<!DOCTYPE html>
             <strong class="fund-name">Fund</strong>
             <div class="meta fund-meta"></div>
           </div>
-          <div class="pill">uploaded</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="pill fund-status">no workbook</span>
+            <button class="btn fund-remove" type="button">Remove</button>
+          </div>
+        </div>
+        <div class="toolbar" style="gap:8px;">
+          <label class="btn secondary fund-import-label" style="display:inline-flex;align-items:center;gap:8px;">
+            <span class="fund-import-text">Import Excel</span>
+            <input type="file" class="fund-import" accept=".xlsx,.xlsm" style="display:none" />
+          </label>
         </div>
         <div class="mapping-grid">
           <div class="field"><label>Display label</label><input type="text" class="fund-label" /></div>
@@ -583,11 +591,12 @@ HTML = r"""<!DOCTYPE html>
     const exportMemoBtn = document.getElementById('exportMemoBtn');
     const projectNameInput = document.getElementById('projectNameInput');
     const memoNameInput = document.getElementById('memoNameInput');
-    const memoFileInput = document.getElementById('memoFileInput');
+    const memoPathInput = document.getElementById('memoPathInput');
+    const browseMemoBtn = document.getElementById('browseMemoBtn');
+    const updateExposuresBtn = document.getElementById('updateExposuresBtn');
     const projectStatus = document.getElementById('projectStatus');
     const liveUpdateToggle = document.getElementById('liveUpdateToggle');
-    const fileInput = document.getElementById('fileInput');
-    const loadBtn = document.getElementById('loadBtn');
+    const addFundBtn = document.getElementById('addFundBtn');
     const clearBtn = document.getElementById('clearBtn');
     const calcBtn = document.getElementById('calcBtn');
     const fundList = document.getElementById('fundList');
@@ -638,6 +647,7 @@ HTML = r"""<!DOCTYPE html>
         project_id: appState.project ? appState.project.project_id : null,
         project_name: projectNameInput.value.trim() || 'Untitled project',
         memo_name: memoNameInput.value.trim() || '',
+        memo_file_path: memoPathInput.value.trim(),
         rules: rulesBox.value || '',
         funds,
       };
@@ -679,6 +689,7 @@ HTML = r"""<!DOCTYPE html>
       appState.project = project;
       projectNameInput.value = project.project_name || 'Untitled project';
       memoNameInput.value = project.memo_name || '';
+      memoPathInput.value = project.memo_file_path || '';
       rulesBox.value = project.rules || '';
       setProjectStatus(project.project_id ? `Project saved: ${project.project_name || 'Untitled project'}` : 'No project loaded');
       populateProjectSelect(appState.projects, project.project_id);
@@ -686,14 +697,14 @@ HTML = r"""<!DOCTYPE html>
 
     async function startNewProject() {
       showError('');
-      const memoFile = memoFileInput.files && memoFileInput.files[0];
-      const form = new FormData();
-      form.append('project_name', projectNameInput.value.trim() || 'Untitled project');
-      form.append('memo_name', memoNameInput.value.trim() || '');
-      if (memoFile) {
-        form.append('memo_file', memoFile);
-      }
-      const resp = await fetch('/api/projects/new', { method: 'POST', body: form });
+      const resp = await fetch('/api/projects/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_name: projectNameInput.value.trim() || 'Untitled project',
+          memo_name: memoNameInput.value.trim() || '',
+        }),
+      });
       const data = await resp.json();
       if (!resp.ok) {
         throw new Error(data.error || 'Unable to create project.');
@@ -701,10 +712,9 @@ HTML = r"""<!DOCTYPE html>
       appState.funds = [];
       appState.result = null;
       fillProjectForm(data.project);
+      memoPathInput.value = '';
       fundList.innerHTML = '';
-      resultsPane.innerHTML = '<div class="small-note">New project started. Load workbooks to begin.</div>';
-      fileInput.value = '';
-      memoFileInput.value = '';
+      resultsPane.innerHTML = '<div class="small-note">New project started. Add a fund to begin.</div>';
       await loadProjectList(data.project.project_id);
     }
 
@@ -715,9 +725,10 @@ HTML = r"""<!DOCTYPE html>
         appState.result = null;
         projectNameInput.value = '';
         memoNameInput.value = '';
+        memoPathInput.value = '';
         rulesBox.value = '';
         fundList.innerHTML = '';
-        resultsPane.innerHTML = '<div class="small-note">No results yet. Load workbooks and click calculate.</div>';
+        resultsPane.innerHTML = '<div class="small-note">No results yet. Add a fund and click calculate.</div>';
         setProjectStatus('No project loaded');
         populateProjectSelect(appState.projects, '');
         return;
@@ -1034,37 +1045,83 @@ HTML = r"""<!DOCTYPE html>
       });
     }
 
-    async function loadFiles() {
+    function addFund() {
+      const fund = {
+        upload_id: 'tmp-' + Math.random().toString(36).slice(2, 10),
+        fund_name: 'Fund ' + (appState.funds.length + 1),
+        bid_amount: 0,
+        manual_category_overrides: { geography: [], asset_class: [], security_type: [] },
+        mapping: {},
+        preview: null,
+        sheet_names: [],
+        default_sheet: '',
+        header_mode: 'auto',
+      };
+      appState.funds.push(fund);
+      renderFunds();
+      scheduleProjectSave();
+    }
+
+    function removeFund(fund) {
+      appState.funds = appState.funds.filter((f) => f !== fund);
+      renderFunds();
+      scheduleProjectSave();
+      scheduleChartRefresh();
+    }
+
+    async function importFundExcel(fund, file) {
       showError('');
-      const files = Array.from(fileInput.files || []);
-      if (!files.length) {
-        showError('Choose one or more workbook files first.');
-        return;
-      }
       const form = new FormData();
-      if (activeProjectId()) {
-        form.append('project_id', activeProjectId());
-      }
-      files.forEach((file) => form.append('files', file));
-      loadBtn.disabled = true;
-      loadBtn.textContent = 'Loading...';
+      if (activeProjectId()) form.append('project_id', activeProjectId());
+      form.append('files', file);
+      const resp = await fetch('/api/load', { method: 'POST', body: form });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Unable to import workbook.');
+      const loaded = (data.funds && data.funds[0]) || null;
+      if (!loaded) throw new Error('No workbook loaded.');
+      // merge the imported workbook into this fund (keep its name/bid/manual mix)
+      fund.upload_id = loaded.upload_id;
+      fund.filename = loaded.filename;
+      fund.sheet_names = loaded.sheet_names;
+      fund.default_sheet = loaded.default_sheet;
+      fund.sheet_name = loaded.default_sheet;
+      fund.header_mode = loaded.header_mode;
+      fund.row_count = loaded.row_count;
+      fund.preview = loaded.preview;
+      fund.mapping = loaded.mapping;
+      renderFunds();
+      appState.result = null;
+      scheduleProjectSave();
+      scheduleChartRefresh();
+    }
+
+    async function updateExposures() {
+      if (!appState.project) { showError('Start or open a project first.'); return; }
+      if (!memoPathInput.value.trim()) { showError('Point to a memo file first (Browse next to "Memo file").'); return; }
+      const payload = projectPayloadFromState();
+      updateExposuresBtn.disabled = true;
+      setProjectStatus('Updating exposures in memo...');
       try {
-        const resp = await fetch('/api/load', { method: 'POST', body: form });
+        const resp = await fetch('/api/projects/update_exposures', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
         const data = await resp.json();
-        if (!resp.ok) {
-          throw new Error(data.error || 'Unable to load workbooks.');
-        }
-        appState.funds = data.funds;
-        renderFunds();
-        resultsPane.innerHTML = '<div class="small-note">Funds loaded. Set bids and hit calculate.</div>';
-        appState.result = null;
-        scheduleProjectSave();
-        scheduleChartRefresh();
-      } catch (err) {
-        showError(err.message || String(err));
+        if (!resp.ok) throw new Error(data.error || 'Unable to update exposures.');
+        setProjectStatus('Exposures updated in: ' + (data.memo_file_path || 'memo'));
       } finally {
-        loadBtn.disabled = false;
-        loadBtn.textContent = 'Load into app';
+        updateExposuresBtn.disabled = false;
+      }
+    }
+
+    async function browseMemo() {
+      const resp = await fetch('/api/pick_file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await resp.json();
+      if (data.error) showError(data.error);
+      if (data.path) {
+        memoPathInput.value = data.path;
+        if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
       }
     }
 
@@ -1102,12 +1159,29 @@ HTML = r"""<!DOCTYPE html>
       const node = template.content.firstElementChild.cloneNode(true);
       node.dataset.uploadId = fund.upload_id;
 
-      node.querySelector('.fund-name').textContent = fund.filename;
-      node.querySelector('.fund-meta').textContent =
-        `${shortId(fund.upload_id)} | ${fund.row_count} rows | ${fund.sheet_names.length} sheet(s)`;
+      const hasWorkbook = !!fund.preview;
+      node.querySelector('.fund-name').textContent = fund.fund_name || fund.filename || 'Fund';
+      node.querySelector('.fund-meta').textContent = hasWorkbook
+        ? `${fund.filename || ''} | ${fund.row_count || 0} rows | ${(fund.sheet_names || []).length} sheet(s)`
+        : 'No workbook imported (set a manual mix below, or import Excel)';
+      const statusPill = node.querySelector('.fund-status');
+      if (statusPill) statusPill.textContent = hasWorkbook ? 'workbook imported' : 'no workbook';
+
+      const importInput = node.querySelector('.fund-import');
+      if (importInput) {
+        importInput.addEventListener('change', () => {
+          const file = importInput.files && importInput.files[0];
+          if (file) importFundExcel(fund, file).catch((err) => showError(err.message || String(err)));
+        });
+      }
+      const importText = node.querySelector('.fund-import-text');
+      if (importText) importText.textContent = hasWorkbook ? 'Replace Excel' : 'Import Excel';
+
+      const removeBtn = node.querySelector('.fund-remove');
+      if (removeBtn) removeBtn.addEventListener('click', () => removeFund(fund));
 
       const labelInput = node.querySelector('.fund-label');
-      labelInput.value = fund.fund_name || defaultLabel(fund.filename);
+      labelInput.value = fund.fund_name || defaultLabel(fund.filename || '');
       labelInput.addEventListener('input', () => {
         fund.fund_name = labelInput.value;
         scheduleProjectSave();
@@ -1263,7 +1337,7 @@ HTML = r"""<!DOCTYPE html>
       return {
         upload_id: uploadId,
         filename: fund.filename,
-        fund_name: label || defaultLabel(fund.filename),
+        fund_name: label || defaultLabel(fund.filename || '') || 'Fund',
         sheet_name: sheetName,
         header_mode: card.querySelector('.fund-header-mode').value || 'auto',
         bid_amount: bidAmount,
@@ -1506,9 +1580,9 @@ HTML = r"""<!DOCTYPE html>
       appState.funds = [];
       appState.result = null;
       fundList.innerHTML = '';
-      resultsPane.innerHTML = '<div class="small-note">No results yet. Load workbooks and click calculate.</div>';
-      fileInput.value = '';
+      resultsPane.innerHTML = '<div class="small-note">No results yet. Add a fund and click calculate.</div>';
       showError('');
+      scheduleProjectSave();
     });
 
     projectSelect.addEventListener('change', async () => {
@@ -1563,7 +1637,12 @@ HTML = r"""<!DOCTYPE html>
       }
     });
 
-    loadBtn.addEventListener('click', loadFiles);
+    addFundBtn.addEventListener('click', addFund);
+    updateExposuresBtn.addEventListener('click', () => updateExposures().catch((err) => showError(err.message || String(err))));
+    browseMemoBtn.addEventListener('click', () => browseMemo().catch((err) => showError(err.message || String(err))));
+    memoPathInput.addEventListener('input', () => {
+      if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
+    });
     calcBtn.addEventListener('click', calculate);
     downloadJsonBtn.addEventListener('click', downloadJson);
     downloadCsvBtn.addEventListener('click', downloadCsv);
@@ -1635,6 +1714,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/projects/export_memo":
                 self._handle_project_export_memo()
+                return
+            if self.path == "/api/projects/update_exposures":
+                self._handle_project_update_exposures()
+                return
+            if self.path == "/api/pick_file":
+                self._handle_pick_file()
                 return
             if self.path == "/api/preview":
                 self._handle_preview()
@@ -1741,10 +1826,57 @@ class Handler(BaseHTTPRequestHandler):
         project["project_name"] = payload.get("project_name") or project.get("project_name") or "Untitled project"
         project["memo_name"] = payload.get("memo_name") or ""
         project["rules"] = payload.get("rules") or ""
+        if payload.get("memo_file_path") is not None:
+            project["memo_file_path"] = payload.get("memo_file_path") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
         self._send_json(200, {"project": saved, "projects": list_project_summaries()})
+
+    def _handle_project_update_exposures(self):
+        payload = self._read_json()
+        project_id = payload.get("project_id")
+        if not project_id:
+            raise ValueError("Project id is required")
+        project = load_project(project_id)
+        project["project_name"] = payload.get("project_name") or project.get("project_name") or "Untitled project"
+        project["memo_name"] = payload.get("memo_name") or project.get("memo_name") or ""
+        project["rules"] = payload.get("rules") or project.get("rules") or ""
+        if payload.get("memo_file_path") is not None:
+            project["memo_file_path"] = payload.get("memo_file_path") or ""
+        memo_path = project.get("memo_file_path") or ""
+        if not memo_path:
+            raise ValueError("Point to a memo file first (use Browse next to 'Memo file').")
+        if not Path(memo_path).exists():
+            raise ValueError(f"Memo file not found: {memo_path}")
+        payload_funds = self._normalize_funds_payload(payload.get("funds"))
+        project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
+        saved = save_project(project)
+        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""))
+        try:
+            update_sections_in_file(memo_path, result, sections=("exposures",))
+        except PermissionError:
+            raise ValueError("Could not write the memo - is it open in Word? Close it and try again.")
+        self._send_json(200, {"ok": True, "memo_file_path": memo_path, "project": saved})
+
+    def _handle_pick_file(self):
+        # The server runs on the user's own machine, so we can pop a native Open dialog
+        # to capture a real absolute path (a browser file input can't expose one).
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title="Select the memo file (in your SharePoint/OneDrive synced folder)",
+                filetypes=[("Word documents", "*.docx"), ("All files", "*.*")],
+            )
+            root.destroy()
+        except Exception as exc:  # tkinter may be unavailable; UI falls back to pasting a path
+            self._send_json(200, {"path": "", "error": f"File dialog unavailable ({exc}). Paste the path instead."})
+            return
+        self._send_json(200, {"path": path or ""})
 
     def _handle_project_export_memo(self):
         payload = self._read_json()
@@ -1866,7 +1998,21 @@ class Handler(BaseHTTPRequestHandler):
             upload_id = fund.get("upload_id") or str(uuid.uuid4())
             source_path = fund.get("source_path") or ""
             if not source_path:
-                raise ValueError(f"Saved workbook is missing for fund {fund.get('fund_name') or fund.get('filename')}")
+                # Manual / not-yet-imported fund: no workbook to reload, keep its inputs.
+                reloaded.append({
+                    "upload_id": upload_id,
+                    "sheet_names": [],
+                    "default_sheet": "",
+                    "sheet_name": fund.get("sheet_name") or "",
+                    "header_mode": fund.get("header_mode") or "auto",
+                    "row_count": 0,
+                    "preview": None,
+                    "mapping": fund.get("column_map") or {},
+                    "fund_name": fund.get("fund_name") or "Untitled fund",
+                    "bid_amount": fund.get("bid_amount") or 0,
+                    "manual_category_overrides": fund.get("manual_category_overrides") or {},
+                })
+                continue
             data = read_upload_bytes(source_path, project_id=project_id)
             sheet_names = read_workbook_metadata(data)
             if not sheet_names:

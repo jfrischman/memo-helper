@@ -217,36 +217,68 @@ def _table2_rows(result: Dict[str, Any]) -> List[List[str]]:
     return rows
 
 
+def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:
+    """Fill + format the two exposure-section tables (concentration, asset-type-by-fund)
+    in an already-open document. Does not touch charts (handled separately)."""
+    if len(doc.tables) < 4:
+        return
+    table2 = _table2_rows(result)
+    _clear_and_set_table_row(doc.tables[2].rows[1], table2[0])
+    for idx, row_values in enumerate(table2[1:], start=2):
+        if idx < len(doc.tables[2].rows):
+            _clear_and_set_table_row(doc.tables[2].rows[idx], row_values)
+
+    table3 = _table3_rows(result)
+    for idx, row_values in enumerate(table3, start=1):
+        if idx < len(doc.tables[3].rows):
+            _clear_and_set_table_row(doc.tables[3].rows[idx], row_values)
+
+    # Formatting (applied to all rows so new categories inherit it):
+    #  - concentration table: Calibri 8; columns 2-6 centered + middle.
+    _format_table(doc.tables[2], center_from_col=1)
+    #  - asset-type-by-fund: Calibri 8; columns 3-6 centered + middle;
+    #    column 2 (sub-asset class) widened + no-wrap to stay on one line.
+    _format_table(doc.tables[3], center_from_col=2, wide_col=1)
+
+
+# Registry of updatable sections -> (table-updater on open doc, whether it also
+# refreshes the native pies). Add new sections (e.g. "returns") here to extend
+# the "Update <section>" actions without touching the call sites.
+SECTION_UPDATERS = {
+    "exposures": (_apply_exposure_tables, True),
+}
+
+
 def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_path: Path) -> Path:
+    """First-pass export: build a fresh memo from the template (or the project's
+    memo_file_path) and write it to output_path. Updates the exposure section."""
     template = _find_project_balance_template(project)
     doc = Document(str(template))
-
-    # Update exposure summary tables.
-    if len(doc.tables) >= 4:
-        table2 = _table2_rows(result)
-        _clear_and_set_table_row(doc.tables[2].rows[1], table2[0])
-        for idx, row_values in enumerate(table2[1:], start=2):
-            if idx < len(doc.tables[2].rows):
-                _clear_and_set_table_row(doc.tables[2].rows[idx], row_values)
-
-        table3 = _table3_rows(result)
-        for idx, row_values in enumerate(table3, start=1):
-            if idx < len(doc.tables[3].rows):
-                _clear_and_set_table_row(doc.tables[3].rows[idx], row_values)
-
-        # Formatting (applied to all rows so new categories inherit it):
-        #  - concentration table: Calibri 8; columns 2-6 centered + middle.
-        _format_table(doc.tables[2], center_from_col=1)
-        #  - asset-type-by-fund: Calibri 8; columns 3-6 centered + middle;
-        #    column 2 (sub-asset class) widened + no-wrap to stay on one line.
-        _format_table(doc.tables[3], center_from_col=2, wide_col=1)
-
+    _apply_exposure_tables(doc, result)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
-
-    # Update the memo's *native* exposure pies in place (asset class / security
-    # type / geography). python-docx cannot edit chart XML, so this runs on the
-    # saved package, rewriting the chart caches. Preserves the memo's chart
-    # styling instead of appending flat PNG images.
+    # Native pies (python-docx can't edit chart XML) -> rewrite caches on the saved package.
     update_native_pies(output_path, result.get("categories", {}) or {})
     return output_path
+
+
+def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposures",)) -> Path:
+    """In-place update of specific sections in an EXISTING memo (e.g. the live SharePoint
+    file), preserving everything else (narrative the analyst has since written).
+    `sections` selects which SECTION_UPDATERS to run; today only 'exposures'."""
+    memo_path = Path(memo_path)
+    if not memo_path.exists():
+        raise FileNotFoundError(f"Memo file not found: {memo_path}")
+    doc = Document(str(memo_path))
+    refresh_pies = False
+    for name in sections:
+        updater = SECTION_UPDATERS.get(name)
+        if not updater:
+            continue
+        fn, also_pies = updater
+        fn(doc, result)
+        refresh_pies = refresh_pies or also_pies
+    doc.save(str(memo_path))   # overwrite the same file in place
+    if refresh_pies:
+        update_native_pies(memo_path, result.get("categories", {}) or {})
+    return memo_path
