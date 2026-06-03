@@ -68,6 +68,34 @@ def canonicalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Common legal-entity suffix tokens dropped when matching the same issuer across funds.
+_LEGAL_SUFFIX_TOKENS = {
+    "inc", "incorporated", "llc", "ltd", "limited", "lp", "llp", "plc", "corp",
+    "corporation", "co", "company", "holdings", "holding", "group", "partners",
+    "sa", "ag", "gmbh", "nv", "bv", "sarl", "spa", "pte", "ab", "as", "oy",
+}
+
+
+def canonical_issuer(name: Any) -> str:
+    """Canonical key for matching the same issuer across funds despite slight naming
+    differences: drop case, punctuation, trailing parentheticals (e.g. "(ii)",
+    "(fka ...)") and common legal suffixes (Inc./LLC/Ltd/Corp/Holdings/Group...).
+    Returns "" if nothing is left (caller should fall back to the raw name)."""
+    text = str(name or "").strip().lower()
+    prev = None
+    while prev != text:  # peel possibly-several trailing parentheticals
+        prev = text
+        text = re.sub(r"\s*\([^()]*\)\s*$", "", text).strip()
+    # drop an instrument descriptor after a spaced dash ("Issuer - Sr. Sub Debt" -> "Issuer")
+    text = re.split(r"\s[–—-]\s", text, maxsplit=1)[0].strip()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    tokens = [t for t in text.split() if t]
+    while tokens and tokens[-1] in _LEGAL_SUFFIX_TOKENS:
+        tokens.pop()
+    return " ".join(tokens)
+
+
 def parse_mapping_rules(text: str) -> Dict[str, str]:
     rules: Dict[str, str] = {}
     for line in (text or "").splitlines():
@@ -641,7 +669,8 @@ def compute_project_exposure(
     fund_rows: List[Dict[str, Any]] = []
     fund_profiles: List[Dict[str, Any]] = []
     project_categories: Dict[str, Dict[str, float]] = {}
-    project_positions: Dict[str, float] = {}
+    project_positions: Dict[str, float] = {}          # canonical issuer key -> summed share
+    position_variants: Dict[str, Dict[str, int]] = {}  # canonical key -> {raw name: count}
 
     for fund, has_wb, manual_families, bid in prepared:
         weight = bid / total_bid
@@ -684,7 +713,11 @@ def compute_project_exposure(
                 family_bucket[item["label"]] = family_bucket.get(item["label"], 0.0) + item["percentage"] * weight
 
         for item in profile["position_exposure"]:
-            project_positions[item["label"]] = project_positions.get(item["label"], 0.0) + item["value"]
+            raw = item["label"]
+            key = canonical_issuer(raw) or str(raw).strip().lower()
+            project_positions[key] = project_positions.get(key, 0.0) + item["value"]
+            variants = position_variants.setdefault(key, {})
+            variants[raw] = variants.get(raw, 0) + 1
 
     category_results: Dict[str, List[Dict[str, Any]]] = {}
     for family, bucket in project_categories.items():
@@ -695,9 +728,38 @@ def compute_project_exposure(
         items.sort(key=lambda item: (-item["value"], item["label"].lower()))
         category_results[family] = items
 
-    top_positions = [
-        {"label": label, "value": value, "percentage": value}
-        for label, value in sorted(project_positions.items(), key=lambda item: (-item[1], item[0].lower()))
+    _paren_tail = re.compile(r"\s*\([^()]*\)\s*$")
+
+    def _display_candidate(raw: str) -> str:
+        # Clean a raw name for display: drop trailing parentheticals and the instrument
+        # descriptor after a spaced dash, but KEEP case and legal form ("GoHealth Inc.").
+        s = str(raw).strip()
+        prev = None
+        while prev != s:
+            prev = s
+            s = _paren_tail.sub("", s).strip()
+        return re.split(r"\s[–—-]\s", s, maxsplit=1)[0].strip()
+
+    def _display_name(variants: Dict[str, int]) -> str:
+        # shortest cleaned variant wins ("GoHealth" over "GoHealth Inc.", "Dayco" over
+        # "Dayco - Sr. Sub Debt"); ties broken alphabetically.
+        cands = [_display_candidate(v) for v in variants] or [""]
+        return min((c for c in cands if c), key=lambda n: (len(n), n.lower()), default="")
+
+    top_positions = []
+    for key, value in sorted(project_positions.items(), key=lambda kv: (-kv[1], kv[0])):
+        variants = position_variants.get(key, {})
+        top_positions.append({
+            "label": _display_name(variants) or key,
+            "value": value,
+            "percentage": value,
+            "variants": sorted(variants.keys()),
+        })
+
+    # Names merged from more than one raw variant, for the review list in the UI.
+    position_merges = [
+        {"label": item["label"], "variants": item["variants"]}
+        for item in top_positions if len(item.get("variants") or []) > 1
     ]
 
     cumulative = 0.0
@@ -717,6 +779,7 @@ def compute_project_exposure(
         "categories": category_results,
         "top_positions": top_positions,
         "top_concentration": top_n,
+        "position_merges": position_merges,
         "summary_sentence": project_sentence,
     }
 

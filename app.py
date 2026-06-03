@@ -1407,9 +1407,32 @@ HTML = r"""<!DOCTYPE html>
         .map(([family, title]) => renderCategoryCard(family, title, data.categories[family]))
         .join('') + '</div>';
       const topPositionsHtml = renderBarCard('Top positions', data.top_positions.slice(0, 15));
+      const mergesHtml = renderMergesCard(data.position_merges || []);
       const fundTableHtml = renderFundTable(data.funds);
 
-      resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + fundTableHtml;
+      resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
+    }
+
+    function renderMergesCard(merges) {
+      if (!merges || !merges.length) return '';
+      const rows = merges.map((m) => `
+        <tr>
+          <td>${escapeHtml(m.label)}</td>
+          <td>${(m.variants || []).map((v) => escapeHtml(v)).join('<br>')}</td>
+        </tr>
+      `).join('');
+      return `
+        <div class="chart-card">
+          <h3>Combined names (review)</h3>
+          <div class="small-note">These raw names were treated as the same issuer and combined at the project level. Check for any wrong merges, or names that should have merged but did not.</div>
+          <div class="preview-wrap">
+            <table>
+              <thead><tr><th>Combined as</th><th>From these names</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
     }
 
     function categoryColor(family, label, index) {
