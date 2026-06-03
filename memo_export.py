@@ -411,15 +411,112 @@ def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:
 # Section registry
 # ---------------------------------------------------------------------------
 
+def _update_current_portfolio_names(doc: Document, result: Dict[str, Any],
+                                    project_name: str = "Project") -> None:
+    """Replace the bold company-name line in each Current Portfolio numbered entry
+    with the live exposure format: 'Name (X.X% ProjectName, X.X% Fund1, ...)'.
+    Finds entries by ilvl=0 List Paragraph paragraphs after the section heading.
+    Works even when content is inside tracked-change elements (<w:ins>/<w:moveTo>).
+    Updates the top 8 positions; skips paragraphs with no text content."""
+    from lxml import etree as _et
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    XML_SPACE = "http://www.w3.org/XML/1998/namespace"
+
+    fund_profiles = result.get("fund_profiles") or []
+    top_positions = result.get("top_positions") or []
+
+    # Per-fund position lookup: {(fund_idx, key): fund_level_%}
+    fund_pos: Dict[tuple, float] = {}
+    for fi, fp in enumerate(fund_profiles):
+        w = float(fp.get("weight") or 0)
+        for pos in (fp.get("position_exposure") or []):
+            key = str(pos.get("key") or pos.get("label") or "").lower()
+            val = float(pos.get("value") or 0)
+            fund_pos[(fi, key)] = (val / w) if w > 0 else 0.0
+
+    def _fmt(pct: float) -> str:
+        return f"{pct * 100:.1f}%"
+
+    def _build_label(pos_item: Dict[str, Any]) -> str:
+        name = pos_item.get("label") or ""
+        key = str(pos_item.get("key") or name).lower()
+        proj_pct = float(pos_item.get("value") or 0)
+        parts = [f"{_fmt(proj_pct)} {project_name}"]
+        for fi, fp in enumerate(fund_profiles):
+            fp_pct = fund_pos.get((fi, key), 0.0)
+            if fp_pct > 0:
+                abbrev = str(fp.get("abbrev_name") or fp.get("fund_name") or f"Fund {fi+1}")
+                parts.append(f"{_fmt(fp_pct)} {abbrev}")
+        return f"{name} ({', '.join(parts)})"
+
+    def _all_text(p_el) -> str:
+        return "".join(t.text or "" for t in p_el.iter() if t.tag == f"{{{W}}}t")
+
+    def _replace_content(p_el, new_text: str):
+        """Keep pPr + bookmarks, replace everything else with a single bold run."""
+        keep_tags = {f"{{{W}}}pPr", f"{{{W}}}bookmarkStart", f"{{{W}}}bookmarkEnd"}
+        for child in list(p_el):
+            if child.tag not in keep_tags:
+                p_el.remove(child)
+        r = _et.SubElement(p_el, f"{{{W}}}r")
+        rPr = _et.SubElement(r, f"{{{W}}}rPr")
+        _et.SubElement(rPr, f"{{{W}}}b")
+        rFonts = _et.SubElement(rPr, f"{{{W}}}rFonts")
+        rFonts.set(f"{{{W}}}ascii", "Calibri")
+        rFonts.set(f"{{{W}}}hAnsi", "Calibri")
+        sz = _et.SubElement(rPr, f"{{{W}}}sz"); sz.set(f"{{{W}}}val", "18")
+        t_el = _et.SubElement(r, f"{{{W}}}t")
+        t_el.text = new_text
+        t_el.set(f"{{{XML_SPACE}}}space", "preserve")
+
+    # Find Current Portfolio section
+    in_section = False
+    label_idx = 0
+    for para in doc.paragraphs:
+        if not in_section:
+            if "Current Portfolio" in para.text:
+                in_section = True
+            continue
+
+        if label_idx >= min(8, len(top_positions)):
+            break
+
+        # Check for ilvl=0 (company entry paragraph)
+        pPr = para._p.find(f"{{{W}}}pPr")
+        if pPr is None:
+            continue
+        numPr = pPr.find(f"{{{W}}}numPr")
+        if numPr is None:
+            continue
+        ilvl_el = numPr.find(f"{{{W}}}ilvl")
+        if ilvl_el is None or ilvl_el.get(f"{{{W}}}val") != "0":
+            continue
+
+        # Skip truly empty paragraphs
+        if not _all_text(para._p).strip():
+            continue
+
+        _replace_content(para._p, _build_label(top_positions[label_idx]))
+        label_idx += 1
+
+
+def _apply_portfolio_names(doc: Document, result: Dict[str, Any]) -> None:
+    """Wrapper that reads project_name from result['_project_name'] (injected before call)."""
+    _update_current_portfolio_names(doc, result, result.get("_project_name") or "Project")
+
+
 SECTION_UPDATERS = {
     "exposures": (_apply_exposure_tables, True),
+    "portfolio_names": (_apply_portfolio_names, False),
 }
 
 
 def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_path: Path) -> Path:
     template = _find_project_balance_template(project)
     doc = Document(str(template))
+    result["_project_name"] = project.get("project_name") or "Project"
     _apply_exposure_tables(doc, result)
+    _apply_portfolio_names(doc, result)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
     lc = parse_label_colors(project.get("label_colors") or "")
@@ -433,6 +530,7 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
     if not memo_path.exists():
         raise FileNotFoundError(f"Memo file not found: {memo_path}")
     doc = Document(str(memo_path))
+    result["_project_name"] = (project or {}).get("project_name") or "Project"
     refresh_pies = False
     for name in sections:
         updater = SECTION_UPDATERS.get(name)

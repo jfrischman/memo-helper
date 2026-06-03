@@ -769,6 +769,7 @@ def compute_project_exposure(
 
         common = {
             "fund_name": fund.get("fund_name") or filename or "Untitled fund",
+            "abbrev_name": fund.get("abbrev_name") or "",
             "filename": filename,
             "sheet_name": sheet_name,
             "header_mode": header_mode,

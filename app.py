@@ -521,6 +521,7 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div class="mapping-grid">
           <div class="field"><label>Display label</label><input type="text" class="fund-label" /></div>
+          <div class="field"><label>Abbreviation (for memo labels, e.g. "BT III")</label><input type="text" class="fund-abbrev" placeholder="e.g. BT III" /></div>
           <div class="field"><label>Sheet</label><select class="fund-sheet"></select></div>
           <div class="field"><label>Header mode</label><select class="fund-header-mode"></select></div>
           <div class="field"><label>Bid amount</label><input type="number" min="0" step="any" class="fund-bid" /></div>
@@ -1212,6 +1213,15 @@ HTML = r"""<!DOCTYPE html>
         scheduleChartRefresh();
       });
 
+      const abbrevInput = node.querySelector('.fund-abbrev');
+      if (abbrevInput) {
+        abbrevInput.value = fund.abbrev_name || '';
+        abbrevInput.addEventListener('input', () => {
+          fund.abbrev_name = abbrevInput.value;
+          scheduleProjectSave();
+        });
+      }
+
       const bidInput = node.querySelector('.fund-bid');
       bidInput.value = fund.bid_amount ?? '';
       bidInput.placeholder = '0';
@@ -1351,6 +1361,7 @@ HTML = r"""<!DOCTYPE html>
       const uploadId = card.dataset.uploadId;
       const fund = appState.funds.find((item) => item.upload_id === uploadId);
       const label = card.querySelector('.fund-label').value.trim();
+      const abbrevName = (card.querySelector('.fund-abbrev')?.value || '').trim();
       const bidAmount = parseFloat(card.querySelector('.fund-bid').value || '0') || 0;
       const sheetName = card.querySelector('.fund-sheet').value;
       const columnMap = {};
@@ -1362,6 +1373,7 @@ HTML = r"""<!DOCTYPE html>
         upload_id: uploadId,
         filename: fund.filename,
         fund_name: label || defaultLabel(fund.filename || '') || 'Fund',
+        abbrev_name: abbrevName,
         sheet_name: sheetName,
         header_mode: card.querySelector('.fund-header-mode').value || 'auto',
         bid_amount: bidAmount,
@@ -2001,7 +2013,7 @@ class Handler(BaseHTTPRequestHandler):
         saved = save_project(project)
         result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "", force_splits=project.get("force_splits") or "")
         try:
-            update_sections_in_file(memo_path, result, sections=("exposures",), project=saved)
+            update_sections_in_file(memo_path, result, sections=("exposures", "portfolio_names"), project=saved)
         except PermissionError:
             raise ValueError("Could not write the memo - is it open in Word? Close it and try again.")
         self._send_json(200, {"ok": True, "memo_file_path": memo_path, "project": saved})
@@ -2137,6 +2149,7 @@ class Handler(BaseHTTPRequestHandler):
                     "sheet_name": fund.get("sheet_name") or (upload or {}).get("default_sheet") or "",
                     "header_mode": fund.get("header_mode") or (upload or {}).get("header_mode") or "auto",
                     "bid_amount": float(fund.get("bid_amount") or 0.0),
+                    "abbrev_name": fund.get("abbrev_name") or "",
                     "manual_category_overrides": fund.get("manual_category_overrides") or {},
                     "column_map": fund.get("column_map") or {},
                     "source_path": source_path,
@@ -2163,6 +2176,7 @@ class Handler(BaseHTTPRequestHandler):
                     "mapping": fund.get("column_map") or {},
                     "fund_name": fund.get("fund_name") or "Untitled fund",
                     "bid_amount": fund.get("bid_amount") or 0,
+                    "abbrev_name": fund.get("abbrev_name") or "",
                     "manual_category_overrides": fund.get("manual_category_overrides") or {},
                 })
                 continue
@@ -2201,6 +2215,7 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     "fund_name": fund.get("fund_name") or fund.get("filename") or "Untitled fund",
                     "bid_amount": fund.get("bid_amount") or 0,
+                    "abbrev_name": fund.get("abbrev_name") or "",
                     "manual_category_overrides": fund.get("manual_category_overrides") or {},
                 }
             )
