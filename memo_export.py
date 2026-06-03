@@ -204,9 +204,13 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
 # Concentration table (table[2]) – dynamic rows (Total + one per fund)
 # ---------------------------------------------------------------------------
 
-def _compute_top_concentration(items: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+def _compute_top_concentration(items: Sequence[Dict[str, Any]],
+                               fund_weight: float = 1.0) -> Dict[str, float]:
+    """Compute top-N concentration. If fund_weight < 1, values are project-shares;
+    divide by fund_weight to get fund-level percentages for the per-fund rows."""
     ordered = sorted(items, key=lambda x: float(x.get("value") or x.get("percentage") or 0), reverse=True)
-    vals = [float(x.get("value") or x.get("percentage") or 0) for x in ordered]
+    scale = (1.0 / fund_weight) if fund_weight > 0 else 1.0
+    vals = [float(x.get("value") or x.get("percentage") or 0) * scale for x in ordered]
     return {
         "top_1": sum(vals[:1]),
         "top_3": sum(vals[:3]),
@@ -226,7 +230,8 @@ def _rebuild_concentration_table(table, result: Dict[str, Any]) -> None:
                   _fmt_pct(top.get("top_5", 0)), _fmt_pct(top.get("top_10", 0)),
                   _fmt_pct(top.get("remaining", 0))]]
     for fp in fund_profiles:
-        p = _compute_top_concentration(fp.get("position_exposure") or [])
+        w = float(fp.get("weight") or 0)
+        p = _compute_top_concentration(fp.get("position_exposure") or [], fund_weight=w)
         data_rows.append([str(fp.get("fund_name") or "Fund"),
                           _fmt_pct(p["top_1"]), _fmt_pct(p["top_3"]),
                           _fmt_pct(p["top_5"]), _fmt_pct(p["top_10"]),

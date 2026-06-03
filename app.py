@@ -1458,7 +1458,9 @@ HTML = r"""<!DOCTYPE html>
       const top = data.top_concentration || {};
       function fundConc(fp) {
         const pos = fp.position_exposure || [];
-        const vals = pos.map((p) => Number(p.value || p.percentage || 0)).sort((a, b) => b - a);
+        const w = Number(fp.weight || 0);
+        const scale = w > 0 ? 1 / w : 1;   // convert project-share → fund-level %
+        const vals = pos.map((p) => Number(p.value || p.percentage || 0) * scale).sort((a, b) => b - a);
         const sum = (n) => vals.slice(0, n).reduce((a, b) => a + b, 0);
         return { top_1: sum(1), top_3: sum(3), top_5: sum(5), top_10: sum(10), remaining: Math.max(0, 1 - sum(10)) };
       }
@@ -2242,18 +2244,30 @@ class Handler(BaseHTTPRequestHandler):
             ws.cell(2, c).number_format = "#,##0.0"
             ws.cell(2, c).alignment = Alignment(horizontal="center")
 
+        # Column letters for the fund columns (C, D, ...)
+        n_funds = len(fund_profiles)
+        first_fund_col = get_column_letter(3)
+        last_fund_col = get_column_letter(2 + n_funds) if n_funds else get_column_letter(3)
+
         # Row 3+: one row per issuer
         for r, pos in enumerate(top_positions):
             row = 3 + r
             label = pos.get("label") or ""
             key = str(pos.get("key") or label).lower()
-            proj_pct = float(pos.get("value") or 0)
 
             ws.cell(row, 1, label).alignment = Alignment(horizontal="left")
-            c2 = ws.cell(row, 2, proj_pct)
+
+            # Project % as a formula: =SUMPRODUCT(fund_pcts × fund_bids) / total_bid
+            # = SUMPRODUCT(C{row}:{last}{row}, C$2:{last}$2) / B$2
+            if n_funds > 0:
+                proj_formula = f"=SUMPRODUCT({first_fund_col}{row}:{last_fund_col}{row},{first_fund_col}$2:{last_fund_col}$2)/B$2"
+            else:
+                proj_formula = "=0"
+            c2 = ws.cell(row, 2, proj_formula)
             c2.number_format = "0.0%"
             c2.alignment = Alignment(horizontal="center")
 
+            # Per-fund % — static values (come from the engine)
             for j, pm in enumerate(fund_pos):
                 fp_pct = pm.get(key)
                 if fp_pct is not None:
