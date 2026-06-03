@@ -132,6 +132,38 @@ def _make_dpt(idx: int, color: str) -> etree._Element:
     return dp
 
 
+def _make_label_txPr(color_hex: str) -> etree._Element:
+    """<c:txPr> with a solid fill text color (for dLbls default or per-slice override)."""
+    txPr = etree.Element(f"{{{C_NS}}}txPr")
+    etree.SubElement(txPr, f"{{{A_NS}}}bodyPr")
+    etree.SubElement(txPr, f"{{{A_NS}}}lstStyle")
+    p = etree.SubElement(txPr, f"{{{A_NS}}}p")
+    pPr = etree.SubElement(p, f"{{{A_NS}}}pPr")
+    defRPr = etree.SubElement(pPr, f"{{{A_NS}}}defRPr")
+    defRPr.set("sz", "800")
+    solidFill = etree.SubElement(defRPr, f"{{{A_NS}}}solidFill")
+    etree.SubElement(solidFill, f"{{{A_NS}}}srgbClr").set("val", color_hex)
+    return txPr
+
+
+def _make_dLbl(idx: int) -> etree._Element:
+    """Per-slice dLbl with white text and explicit show-flags matching dLbls defaults.
+    The show-flags MUST be included — without them Word defaults to showing everything
+    (series name, cat name, value all concatenated), causing 'Series1...' labels."""
+    C = C_NS
+    dl = etree.Element(f"{{{C}}}dLbl")
+    etree.SubElement(dl, f"{{{C}}}idx").set("val", str(idx))
+    # Explicit show flags — match the parent dLbls settings exactly
+    etree.SubElement(dl, f"{{{C}}}showLegendKey").set("val", "0")
+    etree.SubElement(dl, f"{{{C}}}showVal").set("val", "1")
+    etree.SubElement(dl, f"{{{C}}}showCatName").set("val", "0")
+    etree.SubElement(dl, f"{{{C}}}showSerName").set("val", "0")
+    etree.SubElement(dl, f"{{{C}}}showPercent").set("val", "0")
+    etree.SubElement(dl, f"{{{C}}}showBubbleSize").set("val", "0")
+    dl.append(_make_label_txPr("FFFFFF"))
+    return dl
+
+
 def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
                       label_fmt: Callable[[str, float], str]) -> tuple[bytes, List[str]]:
     """
@@ -192,17 +224,28 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
         else:
             ser.append(dp)
 
-    # Remove old per-slice dLbl overrides (they reference old indices).
-    # Leave the dLbls txPr untouched — the template's automatic color gives
-    # white text inside dark slices and dark text outside automatically.
+    # Update dLbls: disable leader lines, set default (outside) color to black,
+    # and add per-slice white overrides for slices >= INSIDE_THRESHOLD.
+    INSIDE_THRESHOLD = 0.08
     if dlbls is not None:
+        # Remove old per-slice overrides
         for dl in list(dlbls.findall("c:dLbl", NS)):
             dlbls.remove(dl)
+
         # Disable leader lines
         for ll in list(dlbls.findall("c:showLeaderLines", NS)):
             dlbls.remove(ll)
-        ll_el = etree.SubElement(dlbls, f"{{{C_NS}}}showLeaderLines")
-        ll_el.set("val", "0")
+        etree.SubElement(dlbls, f"{{{C_NS}}}showLeaderLines").set("val", "0")
+
+        # Default label color: black (for small outside slices)
+        for old_txPr in list(dlbls.findall("c:txPr", NS)):
+            dlbls.remove(old_txPr)
+        dlbls.append(_make_label_txPr("000000"))
+
+        # Per-slice white override for large slices (rendered inside the pie)
+        for i, (base, share) in enumerate(keep):
+            if share >= INSIDE_THRESHOLD:
+                dlbls.insert(i, _make_dLbl(i))
 
     notes = [f"{b}={v:.1%}" for b, v in keep]
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), notes
