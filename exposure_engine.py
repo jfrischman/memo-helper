@@ -78,22 +78,37 @@ _LEGAL_SUFFIX_TOKENS = {
 
 def canonical_issuer(name: Any) -> str:
     """Canonical key for matching the same issuer across funds despite slight naming
-    differences: drop case, punctuation, trailing parentheticals (e.g. "(ii)",
-    "(fka ...)") and common legal suffixes (Inc./LLC/Ltd/Corp/Holdings/Group...).
-    Returns "" if nothing is left (caller should fall back to the raw name)."""
+    differences: drop case, punctuation, instrument suffixes (e.g. '– Sr. Sub Debt'),
+    trailing parentheticals (e.g. '(fka ...)', '(ii)') and legal suffixes.
+
+    Order: strip instrument first, THEN peel parens — this correctly handles names
+    like 'CREO Group (fka Nursery Supplies) – Sr. Sub Debt' where the paren is in
+    the middle until after the instrument is removed."""
     text = str(name or "").strip().lower()
+    # 1. Strip instrument descriptor after spaced dash first
+    text = re.split(r"\s[–—-]\s", text, maxsplit=1)[0].strip()
+    # 2. Peel trailing parentheticals (loop handles multiple, e.g. "(fka X) (ii)")
     prev = None
-    while prev != text:  # peel possibly-several trailing parentheticals
+    while prev != text:
         prev = text
         text = re.sub(r"\s*\([^()]*\)\s*$", "", text).strip()
-    # drop an instrument descriptor after a spaced dash ("Issuer - Sr. Sub Debt" -> "Issuer")
-    text = re.split(r"\s[–—-]\s", text, maxsplit=1)[0].strip()
     text = text.replace("&", " and ")
     text = re.sub(r"[^a-z0-9 ]+", " ", text)
     tokens = [t for t in text.split() if t]
     while tokens and tokens[-1] in _LEGAL_SUFFIX_TOKENS:
         tokens.pop()
     return " ".join(tokens)
+
+
+def parse_force_splits(text: Any) -> set:
+    """Parse a textarea of raw names (one per line) that should NOT be merged with
+    other issuers even if they share the same canonical key."""
+    out = set()
+    for line in str(text or "").splitlines():
+        name = line.strip().lower()
+        if name:
+            out.add(name)
+    return out
 
 
 _PAREN_TAIL = re.compile(r"\s*\([^()]*\)\s*$")
@@ -139,8 +154,12 @@ def parse_issuer_aliases(text: Any) -> Dict[str, str]:
     return out
 
 
-def _effective_key(name: Any, alias_map: Dict[str, str]) -> str:
-    key = canonical_issuer(name) or str(name or "").strip().lower()
+def _effective_key(name: Any, alias_map: Dict[str, str], split_set: set = None) -> str:
+    raw_lower = str(name or "").strip().lower()
+    # Force-split: bypass canonical matching, give this name its own unique key
+    if split_set and raw_lower in split_set:
+        return f"__split__{raw_lower}"
+    key = canonical_issuer(name) or raw_lower
     return alias_map.get(key, key) if alias_map else key
 
 
@@ -621,6 +640,7 @@ def _compute_fund_profile(
     column_map: Dict[str, Optional[str]],
     manual_families: Dict[str, List[Tuple[str, float]]],
     alias_map: Optional[Dict[str, str]] = None,
+    split_set: set = None,
 ) -> Dict[str, Any]:
     nav_col = _resolve_column(df, column_map.get("record_date_nav"))
     if not nav_col:
@@ -638,7 +658,7 @@ def _compute_fund_profile(
     name_col = _resolve_column(invested, column_map.get("investment_name"))
     aliases = alias_map or {}
     invested["_raw"] = invested.apply(lambda row: _position_label(row, name_col), axis=1)
-    invested["_key"] = invested["_raw"].map(lambda r: _effective_key(r, aliases))
+    invested["_key"] = invested["_raw"].map(lambda r: _effective_key(r, aliases, split_set))
     invested["_project_share"] = (invested["_nav"] / total_nav) * fund_weight
 
     out: Dict[str, Any] = {
@@ -696,10 +716,12 @@ def compute_project_exposure(
     uploads: Dict[str, Dict[str, Any]],
     normalization_rules: Dict[str, str],
     issuer_aliases: Any = "",
+    force_splits: Any = "",
 ) -> Dict[str, Any]:
     if not funds:
         raise ValueError("Add at least one fund before calculating exposures")
     alias_map = parse_issuer_aliases(issuer_aliases)
+    split_set = parse_force_splits(force_splits)
 
     # A fund is usable if it has an imported workbook OR manual exposure overrides.
     # Funds with neither (e.g. just added, not yet imported) are skipped, and weights
@@ -737,7 +759,7 @@ def compute_project_exposure(
             sheet_name = fund.get("sheet_name") or upload["default_sheet"]
             header_mode = fund.get("header_mode") or upload.get("header_mode") or "auto"
             df = read_sheet_dataframe(upload["data"], sheet_name, header_mode=header_mode)
-            profile = _compute_fund_profile(df, weight, normalization_rules, column_map, manual_families, alias_map)
+            profile = _compute_fund_profile(df, weight, normalization_rules, column_map, manual_families, alias_map, split_set)
             filename = upload["filename"]
         else:
             sheet_name = ""
@@ -767,7 +789,7 @@ def compute_project_exposure(
                 family_bucket[item["label"]] = family_bucket.get(item["label"], 0.0) + item["percentage"] * weight
 
         for item in profile["position_exposure"]:
-            key = item.get("key") or _effective_key(item["label"], alias_map)
+            key = item.get("key") or _effective_key(item["label"], alias_map, split_set)
             project_positions[key] = project_positions.get(key, 0.0) + item["value"]
             bucket = position_variants.setdefault(key, {})
             for v in (item.get("variants") or [item["label"]]):

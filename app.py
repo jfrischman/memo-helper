@@ -473,6 +473,10 @@ HTML = r"""<!DOCTYPE html>
           <label for="labelColorsBox">Pie label colors — one line per category, <code>Category = white</code> or <code>Category = black</code>. Auto-filled from results (≥7% = white, &lt;7% = black). Edit to override individual slices.</label>
           <textarea id="labelColorsBox" placeholder="Corporate Lending = white&#10;ABS = black&#10;Special Situations = black&#10;North America = white&#10;Europe = black"></textarea>
         </div>
+        <div class="field section-gap">
+          <label for="splitNamesBox">Split names — one raw name per line. These will NOT be merged with other issuers even if they share the same root name. Add via the "Unsplit" button in results, or type directly.</label>
+          <textarea id="splitNamesBox" placeholder="CREO Group Inc.&#10;CREO Group (fka Nursery Supplies)"></textarea>
+        </div>
       </div>
     </section>
 
@@ -612,6 +616,7 @@ HTML = r"""<!DOCTYPE html>
     const rulesBox = document.getElementById('rulesBox');
     const aliasesBox = document.getElementById('aliasesBox');
     const labelColorsBox = document.getElementById('labelColorsBox');
+    const splitNamesBox = document.getElementById('splitNamesBox');
     const resultsPane = document.getElementById('resultsPane');
     const downloadJsonBtn = document.getElementById('downloadJsonBtn');
     const downloadExcelBtn = document.getElementById('downloadExcelBtn');
@@ -661,6 +666,7 @@ HTML = r"""<!DOCTYPE html>
         rules: rulesBox.value || '',
         issuer_aliases: aliasesBox.value || '',
         label_colors: labelColorsBox.value || '',
+        force_splits: splitNamesBox.value || '',
         funds,
       };
     }
@@ -705,6 +711,7 @@ HTML = r"""<!DOCTYPE html>
       rulesBox.value = project.rules || '';
       aliasesBox.value = project.issuer_aliases || '';
       labelColorsBox.value = project.label_colors || '';
+      splitNamesBox.value = project.force_splits || '';
       setProjectStatus(project.project_id ? `Project saved: ${project.project_name || 'Untitled project'}` : 'No project loaded');
       populateProjectSelect(appState.projects, project.project_id);
     }
@@ -743,6 +750,7 @@ HTML = r"""<!DOCTYPE html>
         rulesBox.value = '';
         aliasesBox.value = '';
         labelColorsBox.value = '';
+        splitNamesBox.value = '';
         fundList.innerHTML = '';
         resultsPane.innerHTML = '<div class="small-note">No exposure data yet. Add a fund and click calculate.</div>';
         setProjectStatus('No project loaded');
@@ -1478,6 +1486,21 @@ HTML = r"""<!DOCTYPE html>
       return `<div class="chart-card"><h3>Top Positions</h3><div class="preview-wrap"><table>${thead}${tbody}</table></div></div>`;
     }
 
+    function unsplitMerge(variants) {
+      const existing = (splitNamesBox.value || '').split('\n').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      let added = 0;
+      (variants || []).forEach((v) => {
+        if (!existing.includes(v.trim().toLowerCase())) {
+          splitNamesBox.value = (splitNamesBox.value ? splitNamesBox.value + '\n' : '') + v.trim();
+          added++;
+        }
+      });
+      if (added > 0) {
+        if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
+        scheduleChartRefresh();
+      }
+    }
+
     function renderMergesCard(merges, suggestions) {
       merges = merges || [];
       suggestions = suggestions || [];
@@ -1488,10 +1511,11 @@ HTML = r"""<!DOCTYPE html>
           <tr>
             <td>${escapeHtml(m.label)}</td>
             <td>${(m.variants || []).map((v) => escapeHtml(v)).join('<br>')}</td>
+            <td><button class="btn" style="white-space:nowrap" onclick="unsplitMerge(${JSON.stringify(m.variants || [])})">Unsplit</button></td>
           </tr>
         `).join('');
-        html += '<div class="small-note">These raw names were treated as the same issuer and combined at the project level. Check for any wrong merges.</div>';
-        html += `<div class="preview-wrap"><table><thead><tr><th>Combined as</th><th>From these names</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+        html += '<div class="small-note">These raw names were treated as the same issuer and combined at the project level. Click Unsplit to keep them separate.</div>';
+        html += `<div class="preview-wrap"><table><thead><tr><th>Combined as</th><th>From these names</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
       }
       if (suggestions.length) {
         const items = suggestions.map((s) => `<li>${escapeHtml(s.a)} &nbsp;vs&nbsp; ${escapeHtml(s.b)}</li>`).join('');
@@ -1731,6 +1755,13 @@ HTML = r"""<!DOCTYPE html>
         scheduleProjectSave();
       }
     });
+    splitNamesBox.addEventListener('input', () => {
+      if (appState.project) {
+        setProjectStatus('Unsaved changes');
+        scheduleProjectSave();
+      }
+      scheduleChartRefresh();
+    });
 
     liveUpdateToggle.addEventListener('change', () => {
       if (liveUpdateToggle.checked) {
@@ -1934,6 +1965,8 @@ class Handler(BaseHTTPRequestHandler):
             project["issuer_aliases"] = payload.get("issuer_aliases") or ""
         if payload.get("label_colors") is not None:
             project["label_colors"] = payload.get("label_colors") or ""
+        if payload.get("force_splits") is not None:
+            project["force_splits"] = payload.get("force_splits") or ""
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
@@ -1954,6 +1987,8 @@ class Handler(BaseHTTPRequestHandler):
             project["issuer_aliases"] = payload.get("issuer_aliases") or ""
         if payload.get("label_colors") is not None:
             project["label_colors"] = payload.get("label_colors") or ""
+        if payload.get("force_splits") is not None:
+            project["force_splits"] = payload.get("force_splits") or ""
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         memo_path = project.get("memo_file_path") or ""
@@ -1964,7 +1999,7 @@ class Handler(BaseHTTPRequestHandler):
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
-        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "")
+        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "", force_splits=project.get("force_splits") or "")
         try:
             update_sections_in_file(memo_path, result, sections=("exposures",), project=saved)
         except PermissionError:
@@ -2003,10 +2038,12 @@ class Handler(BaseHTTPRequestHandler):
             project["issuer_aliases"] = payload.get("issuer_aliases") or ""
         if payload.get("label_colors") is not None:
             project["label_colors"] = payload.get("label_colors") or ""
+        if payload.get("force_splits") is not None:
+            project["force_splits"] = payload.get("force_splits") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
-        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "")
+        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "", force_splits=project.get("force_splits") or "")
         export_dir = project_dir(project_id) / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{(saved.get('project_name') or 'memo_helper').strip().replace(' ', '_')}_updated.docx"
@@ -2297,7 +2334,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_json()
         funds = payload.get("funds") or []
         rules = parse_mapping_rules(payload.get("normalization_rules") or "")
-        result = compute_project_exposure(funds, UPLOADS, rules, issuer_aliases=payload.get("issuer_aliases") or "")
+        result = compute_project_exposure(funds, UPLOADS, rules, issuer_aliases=payload.get("issuer_aliases") or "", force_splits=payload.get("force_splits") or "")
         self._send_json(200, result)
 
     def _read_json(self) -> Dict[str, Any]:
