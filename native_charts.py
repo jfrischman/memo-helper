@@ -132,6 +132,40 @@ def _make_dpt(idx: int, color: str) -> etree._Element:
     return dp
 
 
+def _make_txPr(color_hex: str, sz: int = 800) -> etree._Element:
+    """Build a <c:txPr> element with a solid fill color and size."""
+    txPr = etree.Element(f"{{{C_NS}}}txPr")
+    etree.SubElement(txPr, f"{{{A_NS}}}bodyPr")
+    etree.SubElement(txPr, f"{{{A_NS}}}lstStyle")
+    p = etree.SubElement(txPr, f"{{{A_NS}}}p")
+    pPr = etree.SubElement(p, f"{{{A_NS}}}pPr")
+    defRPr = etree.SubElement(pPr, f"{{{A_NS}}}defRPr")
+    defRPr.set("sz", str(sz))
+    solidFill = etree.SubElement(defRPr, f"{{{A_NS}}}solidFill")
+    etree.SubElement(solidFill, f"{{{A_NS}}}srgbClr").set("val", color_hex)
+    return txPr
+
+
+def _apply_label_colors(dlbls: etree._Element, keep_items: list,
+                        inside_threshold: float = 0.08) -> None:
+    """Set default label color to black; override large slices (inside pie) with white.
+    Slices >= inside_threshold are assumed to render inside the pie."""
+    if dlbls is None:
+        return
+    # Default text: black (for outside/small labels)
+    for existing_txPr in list(dlbls.findall("c:txPr", NS)):
+        dlbls.remove(existing_txPr)
+    dlbls.append(_make_txPr("000000"))
+
+    # Per-slice white override for large slices (will be inside the pie)
+    for i, (base, share) in enumerate(keep_items):
+        if share >= inside_threshold:
+            dLbl = etree.Element(f"{{{C_NS}}}dLbl")
+            etree.SubElement(dLbl, f"{{{C_NS}}}idx").set("val", str(i))
+            dLbl.append(_make_txPr("FFFFFF"))
+            dlbls.insert(i, dLbl)
+
+
 def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
                       label_fmt: Callable[[str, float], str]) -> tuple[bytes, List[str]]:
     """
@@ -192,10 +226,11 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
         else:
             ser.append(dp)
 
-    # Remove dLbl manual positions (they reference old indices; let Word auto-position)
+    # Remove old per-slice dLbl overrides then rebuild with white/black text colors
     if dlbls is not None:
         for dl in list(dlbls.findall("c:dLbl", NS)):
             dlbls.remove(dl)
+        _apply_label_colors(dlbls, keep)
 
     notes = [f"{b}={v:.1%}" for b, v in keep]
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), notes

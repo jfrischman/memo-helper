@@ -144,14 +144,15 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
             if txt:
                 label_to_pos[txt] = (ri, ci)
 
+    # Value cells → center-aligned; label cells stay left (default)
     def set_next(label: str, value: str):
-        """Find the cell with `label`, update the cell immediately to its right."""
         pos = label_to_pos.get(label)
         if pos is None:
             return
         ri, ci = pos
         try:
-            _set_cell_text(t.rows[ri].cells[ci + 1], value)
+            _set_cell_text(t.rows[ri].cells[ci + 1], value,
+                           align=WD_ALIGN_PARAGRAPH.CENTER, font_pt=9)
         except (IndexError, Exception):
             pass
 
@@ -161,8 +162,17 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
     set_next("Positions >20%", str(gt20))
     set_next("Underlying Funds", str(len(fund_profiles)))
     set_next("Underlying Investments", str(len(positions)))
-    # Format the whole summary table: center everything, Calibri 9
-    _format_table(t, center_from_col=0, font_pt=9)
+    # Apply Calibri 9 to all cells (deduplicate merged cells by tc identity)
+    seen: set = set()
+    for row in t.rows:
+        for cell in row.cells:
+            if id(cell._tc) in seen:
+                continue
+            seen.add(id(cell._tc))
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.font.name = "Calibri"
+                    run.font.size = Pt(9)
 
 
 # ---------------------------------------------------------------------------
