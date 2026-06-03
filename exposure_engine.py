@@ -96,6 +96,54 @@ def canonical_issuer(name: Any) -> str:
     return " ".join(tokens)
 
 
+_PAREN_TAIL = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def display_issuer(name: Any) -> str:
+    """Human-readable issuer name: drop trailing parentheticals and the instrument
+    descriptor after a spaced dash, but keep case/legal form ("GoHealth Inc.")."""
+    s = str(name or "").strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = _PAREN_TAIL.sub("", s).strip()
+    return re.split(r"\s[–—-]\s", s, maxsplit=1)[0].strip()
+
+
+def _shortest_display(variants) -> str:
+    cands = [c for c in (display_issuer(v) for v in variants) if c]
+    return min(cands, key=lambda n: (len(n), n.lower())) if cands else ""
+
+
+def parse_issuer_aliases(text: Any) -> Dict[str, str]:
+    """Parse alias lines 'variant(s) => issuer' into {canonical(variant): canonical(issuer)}.
+    The left side may list several variants separated by ; or |. Lets the user force
+    a merge the auto-normalizer can't safely make (e.g. 'Noble => Noble Supply and Logistics')."""
+    out: Dict[str, str] = {}
+    if not text:
+        return out
+    for line in str(text).splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = re.split(r"\s*(?:=>|->|=)\s*", raw, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        target = canonical_issuer(parts[1])
+        if not target:
+            continue
+        for variant in re.split(r"[;|]", parts[0]):
+            key = canonical_issuer(variant)
+            if key:
+                out[key] = target
+    return out
+
+
+def _effective_key(name: Any, alias_map: Dict[str, str]) -> str:
+    key = canonical_issuer(name) or str(name or "").strip().lower()
+    return alias_map.get(key, key) if alias_map else key
+
+
 def parse_mapping_rules(text: str) -> Dict[str, str]:
     rules: Dict[str, str] = {}
     for line in (text or "").splitlines():
@@ -572,6 +620,7 @@ def _compute_fund_profile(
     normalization_rules: Dict[str, str],
     column_map: Dict[str, Optional[str]],
     manual_families: Dict[str, List[Tuple[str, float]]],
+    alias_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     nav_col = _resolve_column(df, column_map.get("record_date_nav"))
     if not nav_col:
@@ -587,30 +636,33 @@ def _compute_fund_profile(
         raise ValueError("Record date NAV column contains no positive numeric values")
 
     name_col = _resolve_column(invested, column_map.get("investment_name"))
-    invested["_position"] = invested.apply(lambda row: _position_label(row, name_col), axis=1)
+    aliases = alias_map or {}
+    invested["_raw"] = invested.apply(lambda row: _position_label(row, name_col), axis=1)
+    invested["_key"] = invested["_raw"].map(lambda r: _effective_key(r, aliases))
     invested["_project_share"] = (invested["_nav"] / total_nav) * fund_weight
 
     out: Dict[str, Any] = {
         "total_nav": total_nav,
-        "positions": int(len(invested)),
+        "positions": int(invested["_key"].nunique()),
         "position_exposure": [],
         "categories": {},
         "cash_rows": int(working["_is_cash"].sum()),
     }
 
-    positions = (
-        invested.groupby("_position", dropna=False)["_project_share"]
-        .sum()
-        .sort_values(ascending=False)
-    )
-    out["position_exposure"] = [
-        {
-            "label": str(label),
-            "value": float(value),
-            "percentage": float(value),
-        }
-        for label, value in positions.items()
-    ]
+    # Combine tranches of the same issuer within the fund (e.g. senior + junior debt).
+    pos: List[Dict[str, Any]] = []
+    for key, sub in invested.groupby("_key", dropna=False):
+        value = float(sub["_project_share"].sum())
+        variants = sorted({str(x) for x in sub["_raw"].tolist()})
+        pos.append({
+            "label": _shortest_display(variants) or str(key),
+            "value": value,
+            "percentage": value,
+            "key": str(key),
+            "variants": variants,
+        })
+    pos.sort(key=lambda d: -d["value"])
+    out["position_exposure"] = pos
 
     for family in ["asset_class", "security_type", "geography", "sub_asset_class"]:
         if family in manual_families:
@@ -643,9 +695,11 @@ def compute_project_exposure(
     funds: List[Dict[str, Any]],
     uploads: Dict[str, Dict[str, Any]],
     normalization_rules: Dict[str, str],
+    issuer_aliases: Any = "",
 ) -> Dict[str, Any]:
     if not funds:
         raise ValueError("Add at least one fund before calculating exposures")
+    alias_map = parse_issuer_aliases(issuer_aliases)
 
     # A fund is usable if it has an imported workbook OR manual exposure overrides.
     # Funds with neither (e.g. just added, not yet imported) are skipped, and weights
@@ -683,7 +737,7 @@ def compute_project_exposure(
             sheet_name = fund.get("sheet_name") or upload["default_sheet"]
             header_mode = fund.get("header_mode") or upload.get("header_mode") or "auto"
             df = read_sheet_dataframe(upload["data"], sheet_name, header_mode=header_mode)
-            profile = _compute_fund_profile(df, weight, normalization_rules, column_map, manual_families)
+            profile = _compute_fund_profile(df, weight, normalization_rules, column_map, manual_families, alias_map)
             filename = upload["filename"]
         else:
             sheet_name = ""
@@ -713,11 +767,11 @@ def compute_project_exposure(
                 family_bucket[item["label"]] = family_bucket.get(item["label"], 0.0) + item["percentage"] * weight
 
         for item in profile["position_exposure"]:
-            raw = item["label"]
-            key = canonical_issuer(raw) or str(raw).strip().lower()
+            key = item.get("key") or _effective_key(item["label"], alias_map)
             project_positions[key] = project_positions.get(key, 0.0) + item["value"]
-            variants = position_variants.setdefault(key, {})
-            variants[raw] = variants.get(raw, 0) + 1
+            bucket = position_variants.setdefault(key, {})
+            for v in (item.get("variants") or [item["label"]]):
+                bucket[v] = bucket.get(v, 0) + 1
 
     category_results: Dict[str, List[Dict[str, Any]]] = {}
     for family, bucket in project_categories.items():
@@ -728,39 +782,37 @@ def compute_project_exposure(
         items.sort(key=lambda item: (-item["value"], item["label"].lower()))
         category_results[family] = items
 
-    _paren_tail = re.compile(r"\s*\([^()]*\)\s*$")
-
-    def _display_candidate(raw: str) -> str:
-        # Clean a raw name for display: drop trailing parentheticals and the instrument
-        # descriptor after a spaced dash, but KEEP case and legal form ("GoHealth Inc.").
-        s = str(raw).strip()
-        prev = None
-        while prev != s:
-            prev = s
-            s = _paren_tail.sub("", s).strip()
-        return re.split(r"\s[–—-]\s", s, maxsplit=1)[0].strip()
-
-    def _display_name(variants: Dict[str, int]) -> str:
-        # shortest cleaned variant wins ("GoHealth" over "GoHealth Inc.", "Dayco" over
-        # "Dayco - Sr. Sub Debt"); ties broken alphabetically.
-        cands = [_display_candidate(v) for v in variants] or [""]
-        return min((c for c in cands if c), key=lambda n: (len(n), n.lower()), default="")
-
     top_positions = []
     for key, value in sorted(project_positions.items(), key=lambda kv: (-kv[1], kv[0])):
-        variants = position_variants.get(key, {})
+        variants = sorted(position_variants.get(key, {}).keys())
         top_positions.append({
-            "label": _display_name(variants) or key,
+            "label": _shortest_display(variants) or key,
             "value": value,
             "percentage": value,
-            "variants": sorted(variants.keys()),
+            "key": key,
+            "variants": variants,
         })
 
     # Names merged from more than one raw variant, for the review list in the UI.
     position_merges = [
         {"label": item["label"], "variants": item["variants"]}
-        for item in top_positions if len(item.get("variants") or []) > 1
+        for item in top_positions if len(item["variants"]) > 1
     ]
+
+    # Possible same-issuer pairs that did NOT auto-merge: one issuer key is a token-prefix
+    # of another (e.g. "noble" vs "noble supply and logistics"). User can confirm via alias.
+    keyed = [(it["key"].split(), it["label"]) for it in top_positions if it.get("key")]
+    seen = set()
+    position_merge_suggestions = []
+    for i, (toks_a, label_a) in enumerate(keyed):
+        for toks_b, label_b in keyed[i + 1:]:
+            shorter, longer = (toks_a, toks_b) if len(toks_a) <= len(toks_b) else (toks_b, toks_a)
+            if shorter and len(shorter) < len(longer) and longer[:len(shorter)] == shorter and len(shorter[0]) >= 3:
+                pair = tuple(sorted((label_a, label_b)))
+                if pair not in seen:
+                    seen.add(pair)
+                    position_merge_suggestions.append({"a": pair[0], "b": pair[1]})
+    position_merge_suggestions = position_merge_suggestions[:20]
 
     cumulative = 0.0
     top_n = {}
@@ -780,6 +832,7 @@ def compute_project_exposure(
         "top_positions": top_positions,
         "top_concentration": top_n,
         "position_merges": position_merges,
+        "position_merge_suggestions": position_merge_suggestions,
         "summary_sentence": project_sentence,
     }
 

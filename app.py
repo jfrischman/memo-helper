@@ -462,8 +462,12 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="panel-body">
         <div class="field">
-          <label for="rulesBox">One rule per line. Use <code>raw => normalized</code>.</label>
+          <label for="rulesBox">Category rules — one per line, <code>raw => normalized</code>.</label>
           <textarea id="rulesBox" placeholder="Corp Lending => Corporate Lending&#10;Corp. Lending => Corporate Lending&#10;Special Sits => Special Situations"></textarea>
+        </div>
+        <div class="field section-gap">
+          <label for="aliasesBox">Issuer aliases — force names to one issuer, <code>variant => issuer</code>. The same issuer named differently across funds is auto-combined; use this only for cases it can't catch (e.g. abbreviations).</label>
+          <textarea id="aliasesBox" placeholder="Noble => Noble Supply and Logistics&#10;ABC Co; ABC Holdings => ABC"></textarea>
         </div>
       </div>
     </section>
@@ -602,6 +606,7 @@ HTML = r"""<!DOCTYPE html>
     const fundList = document.getElementById('fundList');
     const errorBox = document.getElementById('errorBox');
     const rulesBox = document.getElementById('rulesBox');
+    const aliasesBox = document.getElementById('aliasesBox');
     const resultsPane = document.getElementById('resultsPane');
     const downloadJsonBtn = document.getElementById('downloadJsonBtn');
     const downloadCsvBtn = document.getElementById('downloadCsvBtn');
@@ -649,6 +654,7 @@ HTML = r"""<!DOCTYPE html>
         memo_name: memoNameInput.value.trim() || '',
         memo_file_path: memoPathInput.value.trim(),
         rules: rulesBox.value || '',
+        issuer_aliases: aliasesBox.value || '',
         funds,
       };
     }
@@ -691,6 +697,7 @@ HTML = r"""<!DOCTYPE html>
       memoNameInput.value = project.memo_name || '';
       memoPathInput.value = project.memo_file_path || '';
       rulesBox.value = project.rules || '';
+      aliasesBox.value = project.issuer_aliases || '';
       setProjectStatus(project.project_id ? `Project saved: ${project.project_name || 'Untitled project'}` : 'No project loaded');
       populateProjectSelect(appState.projects, project.project_id);
     }
@@ -727,6 +734,7 @@ HTML = r"""<!DOCTYPE html>
         memoNameInput.value = '';
         memoPathInput.value = '';
         rulesBox.value = '';
+        aliasesBox.value = '';
         fundList.innerHTML = '';
         resultsPane.innerHTML = '<div class="small-note">No results yet. Add a fund and click calculate.</div>';
         setProjectStatus('No project loaded');
@@ -1363,6 +1371,7 @@ HTML = r"""<!DOCTYPE html>
           body: JSON.stringify({
             funds,
             normalization_rules: rulesBox.value,
+            issuer_aliases: aliasesBox.value,
           }),
         });
         const data = await resp.json();
@@ -1407,32 +1416,34 @@ HTML = r"""<!DOCTYPE html>
         .map(([family, title]) => renderCategoryCard(family, title, data.categories[family]))
         .join('') + '</div>';
       const topPositionsHtml = renderBarCard('Top positions', data.top_positions.slice(0, 15));
-      const mergesHtml = renderMergesCard(data.position_merges || []);
+      const mergesHtml = renderMergesCard(data.position_merges || [], data.position_merge_suggestions || []);
       const fundTableHtml = renderFundTable(data.funds);
 
       resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
     }
 
-    function renderMergesCard(merges) {
-      if (!merges || !merges.length) return '';
-      const rows = merges.map((m) => `
-        <tr>
-          <td>${escapeHtml(m.label)}</td>
-          <td>${(m.variants || []).map((v) => escapeHtml(v)).join('<br>')}</td>
-        </tr>
-      `).join('');
-      return `
-        <div class="chart-card">
-          <h3>Combined names (review)</h3>
-          <div class="small-note">These raw names were treated as the same issuer and combined at the project level. Check for any wrong merges, or names that should have merged but did not.</div>
-          <div class="preview-wrap">
-            <table>
-              <thead><tr><th>Combined as</th><th>From these names</th></tr></thead>
-              <tbody>${rows}</tbody>
-            </table>
-          </div>
-        </div>
-      `;
+    function renderMergesCard(merges, suggestions) {
+      merges = merges || [];
+      suggestions = suggestions || [];
+      if (!merges.length && !suggestions.length) return '';
+      let html = '<div class="chart-card"><h3>Combined names (review)</h3>';
+      if (merges.length) {
+        const rows = merges.map((m) => `
+          <tr>
+            <td>${escapeHtml(m.label)}</td>
+            <td>${(m.variants || []).map((v) => escapeHtml(v)).join('<br>')}</td>
+          </tr>
+        `).join('');
+        html += '<div class="small-note">These raw names were treated as the same issuer and combined at the project level. Check for any wrong merges.</div>';
+        html += `<div class="preview-wrap"><table><thead><tr><th>Combined as</th><th>From these names</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      }
+      if (suggestions.length) {
+        const items = suggestions.map((s) => `<li>${escapeHtml(s.a)} &nbsp;vs&nbsp; ${escapeHtml(s.b)}</li>`).join('');
+        html += '<div class="small-note section-gap">Possibly the same issuer but <strong>not</strong> combined &mdash; if they should be, add an alias above (e.g. <code>' + (suggestions[0] ? escapeHtml(suggestions[0].a) + ' => ' + escapeHtml(suggestions[0].b) : 'variant => issuer') + '</code>):</div>';
+        html += `<ul>${items}</ul>`;
+      }
+      html += '</div>';
+      return html;
     }
 
     function categoryColor(family, label, index) {
@@ -1653,6 +1664,13 @@ HTML = r"""<!DOCTYPE html>
       }
       scheduleChartRefresh();
     });
+    aliasesBox.addEventListener('input', () => {
+      if (appState.project) {
+        setProjectStatus('Unsaved changes');
+        scheduleProjectSave();
+      }
+      scheduleChartRefresh();
+    });
 
     liveUpdateToggle.addEventListener('change', () => {
       if (liveUpdateToggle.checked) {
@@ -1849,6 +1867,8 @@ class Handler(BaseHTTPRequestHandler):
         project["project_name"] = payload.get("project_name") or project.get("project_name") or "Untitled project"
         project["memo_name"] = payload.get("memo_name") or ""
         project["rules"] = payload.get("rules") or ""
+        if payload.get("issuer_aliases") is not None:
+            project["issuer_aliases"] = payload.get("issuer_aliases") or ""
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
@@ -1865,6 +1885,8 @@ class Handler(BaseHTTPRequestHandler):
         project["project_name"] = payload.get("project_name") or project.get("project_name") or "Untitled project"
         project["memo_name"] = payload.get("memo_name") or project.get("memo_name") or ""
         project["rules"] = payload.get("rules") or project.get("rules") or ""
+        if payload.get("issuer_aliases") is not None:
+            project["issuer_aliases"] = payload.get("issuer_aliases") or ""
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         memo_path = project.get("memo_file_path") or ""
@@ -1875,7 +1897,7 @@ class Handler(BaseHTTPRequestHandler):
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
-        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""))
+        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "")
         try:
             update_sections_in_file(memo_path, result, sections=("exposures",))
         except PermissionError:
@@ -1910,10 +1932,12 @@ class Handler(BaseHTTPRequestHandler):
         project["project_name"] = payload.get("project_name") or project.get("project_name") or "Untitled project"
         project["memo_name"] = payload.get("memo_name") or project.get("memo_name") or ""
         project["rules"] = payload.get("rules") or project.get("rules") or ""
+        if payload.get("issuer_aliases") is not None:
+            project["issuer_aliases"] = payload.get("issuer_aliases") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
-        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""))
+        result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "")
         export_dir = project_dir(project_id) / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{(saved.get('project_name') or 'memo_helper').strip().replace(' ', '_')}_updated.docx"
@@ -2103,7 +2127,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_json()
         funds = payload.get("funds") or []
         rules = parse_mapping_rules(payload.get("normalization_rules") or "")
-        result = compute_project_exposure(funds, UPLOADS, rules)
+        result = compute_project_exposure(funds, UPLOADS, rules, issuer_aliases=payload.get("issuer_aliases") or "")
         self._send_json(200, result)
 
     def _read_json(self) -> Dict[str, Any]:
