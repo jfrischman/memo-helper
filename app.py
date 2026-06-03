@@ -486,7 +486,7 @@ HTML = r"""<!DOCTYPE html>
           </label>
           <div class="download-row">
           <button class="btn" id="downloadJsonBtn">Download JSON</button>
-          <button class="btn" id="downloadCsvBtn">Download top positions CSV</button>
+          <button class="btn" id="downloadExcelBtn">Download positions Excel</button>
           </div>
         </div>
       </div>
@@ -614,7 +614,7 @@ HTML = r"""<!DOCTYPE html>
     const labelColorsBox = document.getElementById('labelColorsBox');
     const resultsPane = document.getElementById('resultsPane');
     const downloadJsonBtn = document.getElementById('downloadJsonBtn');
-    const downloadCsvBtn = document.getElementById('downloadCsvBtn');
+    const downloadExcelBtn = document.getElementById('downloadExcelBtn');
 
     function showError(message) {
       if (!message) {
@@ -1637,23 +1637,21 @@ HTML = r"""<!DOCTYPE html>
       URL.revokeObjectURL(url);
     }
 
-    function downloadCsv() {
-      if (!appState.result) {
-        showError('Run a calculation first.');
-        return;
-      }
-      const rows = [['label', 'value', 'percentage']];
-      (appState.result.top_positions || []).forEach((item) => {
-        rows.push([item.label, item.value, item.percentage]);
+    async function downloadPositionsExcel() {
+      if (!appState.result) { showError('Run a calculation first.'); return; }
+      const payload = { result: appState.result, project_name: appState.project ? (appState.project.project_name || 'Project') : 'Project' };
+      const resp = await fetch('/api/download_positions_excel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
-      const csv = rows.map((row) => row.map(csvCell).join(',')).join('\n');
-      const blob = new Blob([csv], { type: 'text/csv' });
+      if (!resp.ok) { const d = await resp.json().catch(() => ({})); showError(d.error || 'Unable to generate Excel.'); return; }
+      const blob = await resp.blob();
+      const name = (resp.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/i);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
-      a.download = 'top_positions.csv';
-      a.click();
-      URL.revokeObjectURL(url);
+      a.href = url; a.download = name ? name[1] : 'position_exposure.xlsx';
+      a.click(); URL.revokeObjectURL(url);
     }
 
     function csvCell(value) {
@@ -1746,7 +1744,7 @@ HTML = r"""<!DOCTYPE html>
     });
     calcBtn.addEventListener('click', calculate);
     downloadJsonBtn.addEventListener('click', downloadJson);
-    downloadCsvBtn.addEventListener('click', downloadCsv);
+    downloadExcelBtn.addEventListener('click', () => downloadPositionsExcel().catch((err) => showError(err.message || String(err))));
 
     (async () => {
       try {
@@ -1827,6 +1825,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/calculate":
                 self._handle_calculate()
+                return
+            if self.path == "/api/download_positions_excel":
+                self._handle_download_positions_excel()
                 return
             self._send_json(404, {"error": "Not found"})
         except Exception as exc:
@@ -2188,6 +2189,95 @@ class Handler(BaseHTTPRequestHandler):
                 "header_mode": preview["header_mode"],
             },
         )
+
+    def _handle_download_positions_excel(self):
+        import io
+        import openpyxl
+        from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter
+
+        payload = self._read_json()
+        result = payload.get("result") or {}
+        project_name = payload.get("project_name") or "Project"
+
+        fund_profiles = result.get("fund_profiles") or []
+        top_positions = result.get("top_positions") or []
+        total_bid = float(result.get("total_bid") or 0)
+
+        fund_names = [fp.get("fund_name") or fp.get("filename") or f"Fund {i+1}"
+                      for i, fp in enumerate(fund_profiles)]
+        fund_bids = [float(fp.get("bid_amount") or 0) for fp in fund_profiles]
+        fund_weights = [float(fp.get("weight") or 0) for fp in fund_profiles]
+
+        # Per-fund position lookup: {issuer_key: fund_level_%}
+        # pos.value = project_share = fund_weight × fund_level_%
+        # so fund_level_% = pos.value / fund_weight
+        fund_pos = []
+        for fp in fund_profiles:
+            w = float(fp.get("weight") or 0)
+            m = {}
+            for pos in (fp.get("position_exposure") or []):
+                key = str(pos.get("key") or pos.get("label") or "").lower()
+                val = float(pos.get("value") or 0)
+                m[key] = (val / w) if w > 0 else 0.0
+            fund_pos.append(m)
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Position Exposure"
+
+        # Row 1: column headers
+        headers = ["Issuer", "Project"] + fund_names
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(1, c, h)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center" if c > 1 else "left")
+
+        # Row 2: bid amounts
+        ws.cell(2, 1, "Bid Amount").font = Font(italic=True)
+        ws.cell(2, 2, total_bid)
+        for j, bid in enumerate(fund_bids):
+            ws.cell(2, 3 + j, bid)
+        for c in range(2, 2 + len(fund_names) + 1):
+            ws.cell(2, c).number_format = "#,##0.0"
+            ws.cell(2, c).alignment = Alignment(horizontal="center")
+
+        # Row 3+: one row per issuer
+        for r, pos in enumerate(top_positions):
+            row = 3 + r
+            label = pos.get("label") or ""
+            key = str(pos.get("key") or label).lower()
+            proj_pct = float(pos.get("value") or 0)
+
+            ws.cell(row, 1, label).alignment = Alignment(horizontal="left")
+            c2 = ws.cell(row, 2, proj_pct)
+            c2.number_format = "0.0%"
+            c2.alignment = Alignment(horizontal="center")
+
+            for j, pm in enumerate(fund_pos):
+                fp_pct = pm.get(key)
+                if fp_pct is not None:
+                    c = ws.cell(row, 3 + j, fp_pct)
+                    c.number_format = "0.0%"
+                    c.alignment = Alignment(horizontal="center")
+
+        # Column widths
+        ws.column_dimensions["A"].width = 32
+        for j in range(len(fund_names) + 1):
+            ws.column_dimensions[get_column_letter(2 + j)].width = 16
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        data = buf.getvalue()
+
+        fname = f"{project_name.replace(' ', '_')}_position_exposure.xlsx"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_calculate(self):
         payload = self._read_json()
