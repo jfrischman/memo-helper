@@ -144,7 +144,20 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
             if txt:
                 label_to_pos[txt] = (ri, ci)
 
-    # Value cells → center-aligned; label cells stay left (default)
+    # 1. Apply Calibri 9 + LEFT alignment to all cells first (dedup merged cells)
+    seen: set = set()
+    for row in t.rows:
+        for cell in row.cells:
+            if id(cell._tc) in seen:
+                continue
+            seen.add(id(cell._tc))
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.name = "Calibri"
+                    run.font.size = Pt(9)
+
+    # 2. Update value cells with CENTER alignment (overrides the LEFT above)
     def set_next(label: str, value: str):
         pos = label_to_pos.get(label)
         if pos is None:
@@ -162,17 +175,6 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
     set_next("Positions >20%", str(gt20))
     set_next("Underlying Funds", str(len(fund_profiles)))
     set_next("Underlying Investments", str(len(positions)))
-    # Apply Calibri 9 to all cells (deduplicate merged cells by tc identity)
-    seen: set = set()
-    for row in t.rows:
-        for cell in row.cells:
-            if id(cell._tc) in seen:
-                continue
-            seen.add(id(cell._tc))
-            for p in cell.paragraphs:
-                for run in p.runs:
-                    run.font.name = "Calibri"
-                    run.font.size = Pt(9)
 
 
 # ---------------------------------------------------------------------------
