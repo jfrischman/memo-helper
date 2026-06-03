@@ -370,6 +370,17 @@ HTML = r"""<!DOCTYPE html>
     .section-gap { margin-top: 4px; }
     .small-note { font-size: 12px; color: var(--muted); line-height: 1.45; }
     .download-row { display:flex; gap:10px; flex-wrap:wrap; }
+    .drop-zone {
+      border: 2px dashed var(--line);
+      border-radius: var(--radius-sm);
+      padding: 12px;
+      transition: border-color .15s, background .15s;
+      cursor: default;
+    }
+    .drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(31,95,116,.05);
+    }
     .pill {
       display:inline-block;
       padding: 2px 8px;
@@ -469,12 +480,15 @@ HTML = r"""<!DOCTYPE html>
             <input type="password" id="openaiKeyInput" placeholder="sk-proj-..." />
           </div>
           <div class="field">
-            <label for="projFilesInput">Project files (LP NAV / Unfunded / Commits source)</label>
-            <div style="display:flex;gap:8px;">
-              <label class="btn secondary" for="projFileUpload" style="display:inline-flex;align-items:center;gap:6px;"><span>Upload</span><input type="file" id="projFileUpload" accept=".pdf,.xlsx,.docx" multiple style="display:none"/></label>
-              <input type="text" id="projFilesPathInput" placeholder="Or paste folder path…" style="flex:1"/>
+            <label>Project files (LP NAV / Unfunded / Commits source)</label>
+            <div id="projDropZone" class="drop-zone" style="display:flex;flex-direction:column;gap:8px;">
+              <div style="display:flex;gap:8px;align-items:center;">
+                <label class="btn secondary" for="projFileUpload" style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap;"><span>Choose files</span><input type="file" id="projFileUpload" accept=".pdf,.xlsx,.docx" multiple style="display:none"/></label>
+                <span class="small-note" style="flex:1">or drag &amp; drop PDFs here</span>
+              </div>
+              <input type="text" id="projFilesPathInput" placeholder="Or paste folder / file path…" style="width:100%"/>
+              <div id="projFilesList" class="small-note"></div>
             </div>
-            <div id="projFilesList" class="small-note" style="margin-top:4px;"></div>
           </div>
         </div>
         <div class="section-gap" id="fundInfoParseStatus" style="display:none;align-items:center;gap:10px;padding:10px 0;">
@@ -657,6 +671,45 @@ HTML = r"""<!DOCTYPE html>
     const parseProjFilesBtn = document.getElementById('parseProjFilesBtn');
     const fundInfoParseStatus = document.getElementById('fundInfoParseStatus');
     const fundInfoParseMsg = document.getElementById('fundInfoParseMsg');
+
+    function setupDropZone(el, onFiles) {
+      el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('drag-over'); });
+      el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('drag-over'); });
+      el.addEventListener('drop', (e) => {
+        e.preventDefault(); el.classList.remove('drag-over');
+        const files = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf') || f.name.toLowerCase().endsWith('.xlsx') || f.name.toLowerCase().endsWith('.docx'));
+        if (files.length) onFiles(files); else showError('Drop PDF, XLSX, or DOCX files only.');
+      });
+    }
+
+    // Project files drop zone
+    const projDropZone = document.getElementById('projDropZone');
+    if (projDropZone) {
+      setupDropZone(projDropZone, async (files) => {
+        if (!appState.project) return;
+        const form = new FormData();
+        form.append('project_id', appState.project.project_id || '');
+        files.forEach(f => form.append('files', f));
+        const r = await fetch('/api/fund_info/upload_proj_files', {method:'POST', body:form});
+        const d = await r.json();
+        if (!r.ok) { showError(d.error || 'Upload failed'); return; }
+        if (!appState.project.project_file_paths) appState.project.project_file_paths = [];
+        (d.paths || []).forEach(p => { if (!appState.project.project_file_paths.includes(p)) appState.project.project_file_paths.push(p); });
+        projFilesPathInput.value = appState.project.project_file_paths.join('\n');
+        projFilesList.textContent = `${appState.project.project_file_paths.length} file(s) ready.`;
+        scheduleProjectSave();
+      });
+    }
+
+    function wireDocDropZones() {
+      document.querySelectorAll('.fi-drop-zone').forEach((zone) => {
+        if (zone._dropWired) return;
+        zone._dropWired = true;
+        const fname = zone.dataset.fund;
+        const dtype = zone.dataset.dtype;
+        setupDropZone(zone, (files) => uploadFundDoc(fname, dtype, files[0]));
+      });
+    }
 
     function showParseSpinner(msg) {
       fundInfoParseMsg.textContent = msg || 'Parsing… (15–45 seconds)';
@@ -1619,6 +1672,7 @@ HTML = r"""<!DOCTYPE html>
         });
       });
       renderFundDocsList(profiles, fis);
+      wireDocDropZones();
     }
 
     function renderFundDocsList(profiles, fis) {
@@ -1641,6 +1695,7 @@ HTML = r"""<!DOCTYPE html>
         </div>`;
       });
       fundDocsList.innerHTML = html;
+      wireDocDropZones();
       fundDocsList.querySelectorAll('.fi-doc-upload').forEach((inp) => {
         inp.addEventListener('change', () => uploadFundDoc(inp.dataset.fund, inp.dataset.dtype, inp.files[0]));
       });
@@ -1651,12 +1706,16 @@ HTML = r"""<!DOCTYPE html>
 
     function docRow(fname, dtype, label, currentPath) {
       const safeF = fname.replace(/"/g,'&quot;');
+      const hasFile = !!currentPath;
       return `<div class="field">
         <label>${escapeHtml(label)}</label>
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-          <label class="btn secondary" style="font-size:12px;padding:6px 10px;">Upload<input type="file" class="fi-doc-upload" data-fund="${safeF}" data-dtype="${dtype}" accept=".pdf" style="display:none"/></label>
-          <input type="text" class="fi-doc-path" data-fund="${safeF}" data-dtype="${dtype}" value="${escapeHtml(currentPath)}" placeholder="Or paste path…" style="flex:1;font-size:12px;min-width:120px"/>
-          <button class="btn fi-parse-btn" data-fund="${safeF}" data-dtype="${dtype}" style="font-size:12px;padding:6px 10px;">${currentPath ? 'Re-parse' : 'Parse'}</button>
+        <div class="drop-zone fi-drop-zone" data-fund="${safeF}" data-dtype="${dtype}" style="display:flex;flex-direction:column;gap:6px;">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <label class="btn secondary" style="font-size:12px;padding:6px 10px;white-space:nowrap;">Choose<input type="file" class="fi-doc-upload" data-fund="${safeF}" data-dtype="${dtype}" accept=".pdf" style="display:none"/></label>
+            <input type="text" class="fi-doc-path" data-fund="${safeF}" data-dtype="${dtype}" value="${escapeHtml(currentPath)}" placeholder="Drag & drop or paste path…" style="flex:1;font-size:12px;min-width:120px"/>
+            <button class="btn fi-parse-btn" data-fund="${safeF}" data-dtype="${dtype}" style="font-size:12px;padding:6px 10px;">${hasFile ? 'Re-parse' : 'Parse'}</button>
+          </div>
+          ${hasFile ? `<div class="small-note" style="font-size:11px;">${escapeHtml(currentPath.split(/[/\\]/).pop())}</div>` : ''}
         </div>
       </div>`;
     }
