@@ -11,6 +11,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
 from native_charts import update_native_pies, parse_label_colors
+from fund_info import effective, fmt_money, fmt_ext
 
 
 PROJECT_BALANCE_TEMPLATE = Path(
@@ -500,6 +501,118 @@ def _update_current_portfolio_names(doc: Document, result: Dict[str, Any],
         label_idx += 1
 
 
+def _update_fund_summary_table(doc: Document, result: Dict[str, Any]) -> None:
+    """Update the fund summary table (table[1]) with live fund information.
+    Columns: Fund | LP NAV | Unf. | Commits | Invest End | Term End |
+             Extensions | IRR | TVPI | RVPI | DPI | Leverage
+    Rows are added/removed to match fund count. Values come from fund_infos
+    stored in result['_fund_infos'] (effective value = override ?? parsed)."""
+    if len(doc.tables) < 2:
+        return
+    import copy
+    from lxml import etree as _et
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    fund_profiles = result.get("fund_profiles") or []
+    fund_infos: Dict[str, Any] = result.get("_fund_infos") or {}
+    n_funds = len(fund_profiles)
+    table = doc.tables[1]
+    tbl = table._tbl
+
+    # Sync row count (header = row 0, data rows = 1..n)
+    header_tr = list(tbl.tr_lst)[0]
+    existing = list(tbl.tr_lst)[1:]
+    for tr in existing[n_funds:]:
+        tbl.remove(tr)
+    for _ in range(n_funds - len(existing)):
+        tbl.append(copy.deepcopy(header_tr))
+
+    # Build and fill one row per fund
+    any_perp = False
+    perp_notes: List[str] = []
+
+    for fi, fp in enumerate(fund_profiles):
+        fname = fp.get("fund_name") or f"Fund {fi + 1}"
+        finfo = fund_infos.get(fname) or {}
+        fields = finfo.get("fields") or {}
+        scale = float(finfo.get("scale_pct") or 100.0)
+
+        def eff(k):
+            v = effective(fields.get(k))
+            return str(v) if v is not None else ""
+
+        ext_field = fields.get("extensions") or {}
+        if ext_field.get("perpetuity"):
+            any_perp = True
+            note = ext_field.get("perpetuity_note") or ""
+            if note and note not in perp_notes:
+                perp_notes.append(note)
+
+        vals = [
+            fname,
+            fmt_money(fields.get("lp_nav"),   scale),
+            fmt_money(fields.get("unfunded"),  scale),
+            fmt_money(fields.get("commits"),   scale),
+            eff("invest_end"),
+            eff("term_end"),
+            fmt_ext(ext_field),
+            eff("irr"),
+            eff("tvpi"),
+            eff("rvpi"),
+            eff("dpi"),
+            eff("leverage"),
+        ]
+
+        row = table.rows[fi + 1]
+        for ci, val in enumerate(vals):
+            if ci >= len(row.cells):
+                break
+            align = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+            _set_cell_text(row.cells[ci], val, align=align, font_pt=8)
+            row.cells[ci].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+    _format_table(table, center_from_col=1)
+
+    # Add / update perpetuity footnote paragraph immediately after table
+    footnote_text = ""
+    if any_perp:
+        note = perp_notes[0] if perp_notes else "after stated extensions, LPAC may approve additional extensions"
+        footnote_text = f"* {note}"
+
+    # Find the paragraph right after table[1] in the body XML
+    body = doc.element.body
+    tbl_el = table._tbl
+    tbl_idx = list(body).index(tbl_el)
+    # Check if next element is already a footnote paragraph (starts with *)
+    next_el = body[tbl_idx + 1] if tbl_idx + 1 < len(body) else None
+    next_text = ""
+    if next_el is not None and next_el.tag == f"{{{W}}}p":
+        next_text = "".join(t.text or "" for t in next_el.iter() if t.tag == f"{{{W}}}t")
+
+    if footnote_text:
+        if next_text.startswith("*"):
+            # Update existing footnote
+            for t in next_el.findall(f".//{{{W}}}t"):
+                t.text = footnote_text
+        else:
+            # Insert new footnote paragraph
+            from lxml import etree as _et2
+            fn_p = _et2.Element(f"{{{W}}}p")
+            fn_pPr = _et2.SubElement(fn_p, f"{{{W}}}pPr")
+            fn_rPr = _et2.SubElement(fn_p, f"{{{W}}}r")
+            fn_rPrInner = _et2.SubElement(fn_rPr, f"{{{W}}}rPr")
+            fn_sz = _et2.SubElement(fn_rPrInner, f"{{{W}}}sz"); fn_sz.set(f"{{{W}}}val", "10")  # 5pt = 10 half-pts
+            fn_szCs = _et2.SubElement(fn_rPrInner, f"{{{W}}}szCs"); fn_szCs.set(f"{{{W}}}val", "10")
+            fn_font = _et2.SubElement(fn_rPrInner, f"{{{W}}}rFonts")
+            fn_font.set(f"{{{W}}}ascii", "Calibri"); fn_font.set(f"{{{W}}}hAnsi", "Calibri")
+            fn_t = _et2.SubElement(fn_rPr, f"{{{W}}}t")
+            fn_t.text = footnote_text
+            tbl_el.addnext(fn_p)
+    elif next_text.startswith("*"):
+        # Remove stale footnote (no longer perpetuity)
+        body.remove(next_el)
+
+
 def _apply_portfolio_names(doc: Document, result: Dict[str, Any]) -> None:
     """Wrapper that reads project_name from result['_project_name'] (injected before call)."""
     _update_current_portfolio_names(doc, result, result.get("_project_name") or "Project")
@@ -508,6 +621,7 @@ def _apply_portfolio_names(doc: Document, result: Dict[str, Any]) -> None:
 SECTION_UPDATERS = {
     "exposures": (_apply_exposure_tables, True),
     "portfolio_names": (_apply_portfolio_names, False),
+    "fund_info": (_update_fund_summary_table, False),
 }
 
 
@@ -515,6 +629,7 @@ def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_pa
     template = _find_project_balance_template(project)
     doc = Document(str(template))
     result["_project_name"] = project.get("project_name") or "Project"
+    result["_fund_infos"] = project.get("fund_infos") or {}
     _apply_exposure_tables(doc, result)
     _apply_portfolio_names(doc, result)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,6 +646,7 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
         raise FileNotFoundError(f"Memo file not found: {memo_path}")
     doc = Document(str(memo_path))
     result["_project_name"] = (project or {}).get("project_name") or "Project"
+    result["_fund_infos"] = (project or {}).get("fund_infos") or {}
     refresh_pies = False
     for name in sections:
         updater = SECTION_UPDATERS.get(name)

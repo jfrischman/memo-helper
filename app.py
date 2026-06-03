@@ -401,6 +401,8 @@ HTML = r"""<!DOCTYPE html>
           <button class="btn secondary" id="newProjectBtn">Start new project</button>
           <button class="btn" id="saveProjectBtn">Save project</button>
           <button class="btn primary" id="updateExposuresBtn">Update Exposures</button>
+          <button class="btn primary" id="updateFundInfoBtn" style="background:var(--accent-2)">Update Fund Information</button>
+          <button class="btn" id="updateAllBtn">Update All</button>
           <button class="btn" id="exportMemoBtn">Export memo</button>
         </div>
       </div>
@@ -450,6 +452,35 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="errorBox" class="error section-gap"></div>
         <div id="fundList" class="grid section-gap"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Fund Information</h2>
+        <div class="toolbar">
+          <button class="btn secondary" id="parseProjFilesBtn">Parse project files</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));">
+          <div class="field">
+            <label for="openaiKeyInput">OpenAI API Key</label>
+            <input type="password" id="openaiKeyInput" placeholder="sk-proj-..." />
+          </div>
+          <div class="field">
+            <label for="projFilesInput">Project files (LP NAV / Unfunded / Commits source)</label>
+            <div style="display:flex;gap:8px;">
+              <label class="btn secondary" for="projFileUpload" style="display:inline-flex;align-items:center;gap:6px;"><span>Upload</span><input type="file" id="projFileUpload" accept=".pdf,.xlsx,.docx" multiple style="display:none"/></label>
+              <input type="text" id="projFilesPathInput" placeholder="Or paste folder path…" style="flex:1"/>
+            </div>
+            <div id="projFilesList" class="small-note" style="margin-top:4px;"></div>
+          </div>
+        </div>
+        <div class="section-gap" id="fundInfoTableWrap">
+          <div class="small-note">Add funds and parse documents to populate the fund information table.</div>
+        </div>
+        <div class="section-gap" id="fundDocsList"></div>
       </div>
     </section>
 
@@ -607,6 +638,15 @@ HTML = r"""<!DOCTYPE html>
     const memoPathInput = document.getElementById('memoPathInput');
     const browseMemoBtn = document.getElementById('browseMemoBtn');
     const updateExposuresBtn = document.getElementById('updateExposuresBtn');
+    const updateFundInfoBtn = document.getElementById('updateFundInfoBtn');
+    const updateAllBtn = document.getElementById('updateAllBtn');
+    const openaiKeyInput = document.getElementById('openaiKeyInput');
+    const projFileUpload = document.getElementById('projFileUpload');
+    const projFilesPathInput = document.getElementById('projFilesPathInput');
+    const projFilesList = document.getElementById('projFilesList');
+    const fundInfoTableWrap = document.getElementById('fundInfoTableWrap');
+    const fundDocsList = document.getElementById('fundDocsList');
+    const parseProjFilesBtn = document.getElementById('parseProjFilesBtn');
     const projectStatus = document.getElementById('projectStatus');
     const liveUpdateToggle = document.getElementById('liveUpdateToggle');
     const addFundBtn = document.getElementById('addFundBtn');
@@ -668,6 +708,9 @@ HTML = r"""<!DOCTYPE html>
         issuer_aliases: aliasesBox.value || '',
         label_colors: labelColorsBox.value || '',
         force_splits: splitNamesBox.value || '',
+        openai_key: openaiKeyInput.value.trim(),
+        project_file_paths: projFilesPathInput.value.trim().split('\n').map(s=>s.trim()).filter(Boolean),
+        fund_infos: getFundInfos(),
         funds,
       };
     }
@@ -713,6 +756,8 @@ HTML = r"""<!DOCTYPE html>
       aliasesBox.value = project.issuer_aliases || '';
       labelColorsBox.value = project.label_colors || '';
       splitNamesBox.value = project.force_splits || '';
+      openaiKeyInput.value = project.openai_key || '';
+      projFilesPathInput.value = (project.project_file_paths || []).join('\n');
       setProjectStatus(project.project_id ? `Project saved: ${project.project_name || 'Untitled project'}` : 'No project loaded');
       populateProjectSelect(appState.projects, project.project_id);
     }
@@ -752,6 +797,10 @@ HTML = r"""<!DOCTYPE html>
         aliasesBox.value = '';
         labelColorsBox.value = '';
         splitNamesBox.value = '';
+        openaiKeyInput.value = '';
+        projFilesPathInput.value = '';
+        fundInfoTableWrap.innerHTML = '<div class="small-note">Add funds and parse documents to populate the fund information table.</div>';
+        fundDocsList.innerHTML = '';
         fundList.innerHTML = '';
         resultsPane.innerHTML = '<div class="small-note">No exposure data yet. Add a fund and click calculate.</div>';
         setProjectStatus('No project loaded');
@@ -1409,6 +1458,7 @@ HTML = r"""<!DOCTYPE html>
         appState.result = data;
         renderResults(data);
         autoFillLabelColors(data);
+        renderFundInfoTable();
       } catch (err) {
         showError(err.message || String(err));
       } finally {
@@ -1471,6 +1521,238 @@ HTML = r"""<!DOCTYPE html>
       const unique = lines.filter((l) => { const k = l.split('=')[0].trim().toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
       labelColorsBox.value = unique.join('\n');
       scheduleProjectSave();
+    }
+
+    // ---- Fund Information ----
+
+    const FI_FIELDS = ['lp_nav','unfunded','commits','invest_end','term_end','extensions','irr','tvpi','rvpi','dpi','leverage'];
+    const FI_LABELS = ['LP NAV','Unf.','Commits','Invest End','Term End','Extensions','IRR','TVPI','RVPI','DPI','Leverage'];
+
+    function getFundInfos() { return (appState.project && appState.project.fund_infos) ? appState.project.fund_infos : {}; }
+
+    function saveFundInfos(fis) {
+      if (!appState.project) return;
+      appState.project.fund_infos = fis;
+      setProjectStatus('Unsaved changes');
+      scheduleProjectSave();
+    }
+
+    function getEffective(field) {
+      if (!field || typeof field !== 'object') return field || '';
+      return field.override !== null && field.override !== undefined ? field.override : (field.value ?? '');
+    }
+
+    function renderFundInfoTable() {
+      const profiles = appState.result ? (appState.result.fund_profiles || []) : [];
+      const fis = getFundInfos();
+      if (!profiles.length) {
+        fundInfoTableWrap.innerHTML = '<div class="small-note">Calculate exposures first to populate fund list.</div>';
+        renderFundDocsList([], fis);
+        return;
+      }
+      let html = `<div class="preview-wrap"><table><thead>
+        <tr><th>Fund</th><th>Scale%</th>${FI_LABELS.map(l=>`<th>${escapeHtml(l)}</th>`).join('')}</tr>
+      </thead><tbody>`;
+      profiles.forEach((fp) => {
+        const fname = fp.fund_name || fp.filename || 'Fund';
+        const fi = fis[fname] || {};
+        const fields = fi.fields || {};
+        const scale = fi.scale_pct !== undefined ? fi.scale_pct : 100;
+        html += `<tr data-fund="${escapeHtml(fname)}">
+          <td>${escapeHtml(fname)}</td>
+          <td><input type="number" class="fi-scale" data-fund="${escapeHtml(fname)}" value="${scale}" min="0" max="100" step="0.1" style="width:64px"/></td>`;
+        FI_FIELDS.forEach((key) => {
+          const f = fields[key] || {};
+          const val = getEffective(f);
+          const src = f.source || '';
+          const perp = key === 'extensions' && f.perpetuity ? ' *' : '';
+          html += `<td>
+            <input type="text" class="fi-cell" data-fund="${escapeHtml(fname)}" data-field="${key}"
+              value="${escapeHtml(String(val !== null && val !== undefined ? val : ''))}"
+              placeholder="${src ? '(parsed)' : ''}" style="width:90px"/>
+            ${src ? `<span title="${escapeHtml(src)}" style="cursor:help;color:var(--accent);font-size:11px"> ⓘ</span>${perp}` : perp}
+          </td>`;
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+      fundInfoTableWrap.innerHTML = html;
+      // Listeners
+      fundInfoTableWrap.querySelectorAll('.fi-cell').forEach((input) => {
+        input.addEventListener('change', () => {
+          const fname = input.dataset.fund;
+          const field = input.dataset.field;
+          const fis2 = getFundInfos();
+          if (!fis2[fname]) fis2[fname] = {scale_pct:100, fields:{}};
+          if (!fis2[fname].fields[field]) fis2[fname].fields[field] = {value:null,source:null,override:null};
+          const v = input.value.trim();
+          fis2[fname].fields[field].override = v === '' ? null : v;
+          saveFundInfos(fis2);
+        });
+      });
+      fundInfoTableWrap.querySelectorAll('.fi-scale').forEach((input) => {
+        input.addEventListener('change', () => {
+          const fname = input.dataset.fund;
+          const fis2 = getFundInfos();
+          if (!fis2[fname]) fis2[fname] = {scale_pct:100, fields:{}};
+          fis2[fname].scale_pct = parseFloat(input.value) || 100;
+          saveFundInfos(fis2);
+        });
+      });
+      renderFundDocsList(profiles, fis);
+    }
+
+    function renderFundDocsList(profiles, fis) {
+      if (!profiles.length) { fundDocsList.innerHTML = ''; return; }
+      let html = '';
+      profiles.forEach((fp) => {
+        const fname = fp.fund_name || 'Fund';
+        const fi = fis[fname] || {};
+        const safeF = fname.replace(/"/g, '&quot;');
+        const ql = fi.quarterly_letter_path || '';
+        const afs = fi.afs_path || '';
+        const lpa = fi.lpa_path || '';
+        html += `<div class="chart-card" style="margin-bottom:10px;">
+          <h3>${escapeHtml(fname)} — Documents</h3>
+          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
+            ${docRow(fname,'quarterly_letter','Quarterly Letter', ql)}
+            ${docRow(fname,'afs','Audited Financials (AFS)', afs)}
+            ${docRow(fname,'lpa','LPA', lpa)}
+          </div>
+        </div>`;
+      });
+      fundDocsList.innerHTML = html;
+      fundDocsList.querySelectorAll('.fi-doc-upload').forEach((inp) => {
+        inp.addEventListener('change', () => uploadFundDoc(inp.dataset.fund, inp.dataset.dtype, inp.files[0]));
+      });
+      fundDocsList.querySelectorAll('.fi-parse-btn').forEach((btn) => {
+        btn.addEventListener('click', () => parseFundDoc(btn.dataset.fund, btn.dataset.dtype, btn));
+      });
+    }
+
+    function docRow(fname, dtype, label, currentPath) {
+      const safeF = fname.replace(/"/g,'&quot;');
+      return `<div class="field">
+        <label>${escapeHtml(label)}</label>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <label class="btn secondary" style="font-size:12px;padding:6px 10px;">Upload<input type="file" class="fi-doc-upload" data-fund="${safeF}" data-dtype="${dtype}" accept=".pdf" style="display:none"/></label>
+          <input type="text" class="fi-doc-path" data-fund="${safeF}" data-dtype="${dtype}" value="${escapeHtml(currentPath)}" placeholder="Or paste path…" style="flex:1;font-size:12px;min-width:120px"/>
+          <button class="btn fi-parse-btn" data-fund="${safeF}" data-dtype="${dtype}" style="font-size:12px;padding:6px 10px;">${currentPath ? 'Re-parse' : 'Parse'}</button>
+        </div>
+      </div>`;
+    }
+
+    async function uploadFundDoc(fname, dtype, file) {
+      if (!file || !appState.project) return;
+      showError('');
+      const form = new FormData();
+      form.append('project_id', appState.project.project_id || '');
+      form.append('fund_name', fname);
+      form.append('doc_type', dtype);
+      form.append('file', file);
+      const r = await fetch('/api/fund_info/upload_doc', {method:'POST', body:form});
+      const d = await r.json();
+      if (!r.ok) { showError(d.error || 'Upload failed'); return; }
+      const fis = getFundInfos();
+      if (!fis[fname]) fis[fname] = {scale_pct:100, fields:{}};
+      fis[fname][dtype + '_path'] = d.path;
+      saveFundInfos(fis);
+      renderFundInfoTable();
+      setProjectStatus(`Uploaded ${dtype} for ${fname}. Click Parse to extract data.`);
+    }
+
+    async function parseFundDoc(fname, dtype, btn) {
+      if (!appState.project) return;
+      const fis = getFundInfos();
+      const fi = fis[fname] || {};
+      // Check for path from path input first
+      const pathInput = fundDocsList.querySelector(`.fi-doc-path[data-fund="${fname}"][data-dtype="${dtype}"]`);
+      if (pathInput && pathInput.value.trim()) {
+        if (!fi[dtype + '_path'] || fi[dtype + '_path'] !== pathInput.value.trim()) {
+          if (!fis[fname]) fis[fname] = {scale_pct:100, fields:{}};
+          fis[fname][dtype + '_path'] = pathInput.value.trim();
+          saveFundInfos(fis);
+        }
+      }
+      const path = (fis[fname] || {})[dtype + '_path'];
+      if (!path) { showError(`No ${dtype} file set for ${fname}. Upload or paste a path first.`); return; }
+      const apiKey = openaiKeyInput.value.trim();
+      if (!apiKey) { showError('Enter your OpenAI API key first.'); return; }
+      const origText = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Parsing…';
+      showError('');
+      try {
+        const r = await fetch('/api/fund_info/parse', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({project_id:appState.project.project_id,fund_name:fname,doc_type:dtype,file_path:path,api_key:apiKey})});
+        const d = await r.json();
+        if (!r.ok) { showError(d.error || 'Parse failed'); return; }
+        // Merge extracted fields into fis
+        const fis2 = getFundInfos();
+        if (!fis2[fname]) fis2[fname] = {scale_pct:100, fields:{}};
+        Object.entries(d.fields || {}).forEach(([k, v]) => {
+          if (!fis2[fname].fields[k]) fis2[fname].fields[k] = {value:null,source:null,override:null};
+          Object.assign(fis2[fname].fields[k], v);
+        });
+        saveFundInfos(fis2);
+        renderFundInfoTable();
+        setProjectStatus(`Parsed ${dtype} for ${fname}.`);
+      } finally { btn.disabled = false; btn.textContent = origText; }
+    }
+
+    async function parseProjFiles() {
+      if (!appState.project || !appState.result) return;
+      const apiKey = openaiKeyInput.value.trim();
+      if (!apiKey) { showError('Enter your OpenAI API key first.'); return; }
+      const paths = appState.project.project_file_paths || [];
+      if (!paths.length) { showError('Upload or add project files first.'); return; }
+      const fundNames = (appState.result.fund_profiles || []).map(fp => fp.fund_name || fp.filename || '').filter(Boolean);
+      parseProjFilesBtn.disabled = true; parseProjFilesBtn.textContent = 'Parsing…';
+      try {
+        const r = await fetch('/api/fund_info/parse_project', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({project_id:appState.project.project_id,file_paths:paths,fund_names:fundNames,api_key:apiKey})});
+        const d = await r.json();
+        if (!r.ok) { showError(d.error || 'Parse failed'); return; }
+        const fis = getFundInfos();
+        Object.entries(d.results || {}).forEach(([fname, extracted]) => {
+          if (!fis[fname]) fis[fname] = {scale_pct:100, fields:{}};
+          Object.entries(extracted || {}).forEach(([k, v]) => {
+            if (!fis[fname].fields[k]) fis[fname].fields[k] = {value:null,source:null,override:null};
+            Object.assign(fis[fname].fields[k], v);
+          });
+        });
+        saveFundInfos(fis);
+        renderFundInfoTable();
+        setProjectStatus('Project files parsed.');
+      } finally { parseProjFilesBtn.disabled = false; parseProjFilesBtn.textContent = 'Parse project files'; }
+    }
+
+    async function updateFundInfo() {
+      if (!appState.project) { showError('Start or open a project first.'); return; }
+      if (!memoPathInput.value.trim()) { showError('Point to a memo file first.'); return; }
+      const payload = {...projectPayloadFromState(), fund_infos: getFundInfos()};
+      updateFundInfoBtn.disabled = true;
+      setProjectStatus('Updating fund information in memo…');
+      try {
+        const r = await fetch('/api/projects/update_fund_info', {method:'POST',
+          headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Update failed');
+        setProjectStatus('Fund information updated in memo.');
+      } finally { updateFundInfoBtn.disabled = false; }
+    }
+
+    async function updateAll() {
+      if (!appState.project) { showError('Start or open a project first.'); return; }
+      updateAllBtn.disabled = true;
+      setProjectStatus('Updating all…');
+      try {
+        await updateExposures();
+        await updateFundInfo();
+        setProjectStatus('Update All complete.');
+      } catch(e) { showError(e.message || String(e)); }
+      finally { updateAllBtn.disabled = false; }
     }
 
     function renderConcentrationTable(data) {
@@ -1783,6 +2065,25 @@ HTML = r"""<!DOCTYPE html>
 
     addFundBtn.addEventListener('click', addFund);
     updateExposuresBtn.addEventListener('click', () => updateExposures().catch((err) => showError(err.message || String(err))));
+    updateFundInfoBtn.addEventListener('click', () => updateFundInfo().catch((err) => showError(err.message || String(err))));
+    updateAllBtn.addEventListener('click', () => updateAll().catch((err) => showError(err.message || String(err))));
+    parseProjFilesBtn.addEventListener('click', () => parseProjFiles().catch((err) => showError(err.message || String(err))));
+    openaiKeyInput.addEventListener('input', () => { if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); } });
+    projFilesPathInput.addEventListener('input', () => { if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); } });
+    projFileUpload.addEventListener('change', async () => {
+      if (!appState.project || !projFileUpload.files.length) return;
+      const form = new FormData();
+      form.append('project_id', appState.project.project_id || '');
+      Array.from(projFileUpload.files).forEach(f => form.append('files', f));
+      const r = await fetch('/api/fund_info/upload_proj_files', {method:'POST', body:form});
+      const d = await r.json();
+      if (!r.ok) { showError(d.error || 'Upload failed'); return; }
+      if (!appState.project.project_file_paths) appState.project.project_file_paths = [];
+      (d.paths || []).forEach(p => { if (!appState.project.project_file_paths.includes(p)) appState.project.project_file_paths.push(p); });
+      projFilesPathInput.value = appState.project.project_file_paths.join('\n');
+      projFilesList.textContent = `${appState.project.project_file_paths.length} file(s) set.`;
+      scheduleProjectSave();
+    });
     browseMemoBtn.addEventListener('click', () => browseMemo().catch((err) => showError(err.message || String(err))));
     memoPathInput.addEventListener('input', () => {
       if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
@@ -1873,6 +2174,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/download_positions_excel":
                 self._handle_download_positions_excel()
+                return
+            if self.path == "/api/fund_info/upload_doc":
+                self._handle_fund_info_upload_doc()
+                return
+            if self.path == "/api/fund_info/upload_proj_files":
+                self._handle_fund_info_upload_proj_files()
+                return
+            if self.path == "/api/fund_info/parse":
+                self._handle_fund_info_parse()
+                return
+            if self.path == "/api/fund_info/parse_project":
+                self._handle_fund_info_parse_project()
+                return
+            if self.path == "/api/projects/update_fund_info":
+                self._handle_project_update_fund_info()
                 return
             self._send_json(404, {"error": "Not found"})
         except Exception as exc:
@@ -1979,6 +2295,12 @@ class Handler(BaseHTTPRequestHandler):
             project["label_colors"] = payload.get("label_colors") or ""
         if payload.get("force_splits") is not None:
             project["force_splits"] = payload.get("force_splits") or ""
+        if payload.get("openai_key") is not None:
+            project["openai_key"] = payload.get("openai_key") or ""
+        if payload.get("project_file_paths") is not None:
+            project["project_file_paths"] = payload.get("project_file_paths") or []
+        if payload.get("fund_infos") is not None:
+            project["fund_infos"] = payload.get("fund_infos") or {}
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
@@ -2001,6 +2323,12 @@ class Handler(BaseHTTPRequestHandler):
             project["label_colors"] = payload.get("label_colors") or ""
         if payload.get("force_splits") is not None:
             project["force_splits"] = payload.get("force_splits") or ""
+        if payload.get("openai_key") is not None:
+            project["openai_key"] = payload.get("openai_key") or ""
+        if payload.get("project_file_paths") is not None:
+            project["project_file_paths"] = payload.get("project_file_paths") or []
+        if payload.get("fund_infos") is not None:
+            project["fund_infos"] = payload.get("fund_infos") or {}
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         memo_path = project.get("memo_file_path") or ""
@@ -2052,6 +2380,12 @@ class Handler(BaseHTTPRequestHandler):
             project["label_colors"] = payload.get("label_colors") or ""
         if payload.get("force_splits") is not None:
             project["force_splits"] = payload.get("force_splits") or ""
+        if payload.get("openai_key") is not None:
+            project["openai_key"] = payload.get("openai_key") or ""
+        if payload.get("project_file_paths") is not None:
+            project["project_file_paths"] = payload.get("project_file_paths") or []
+        if payload.get("fund_infos") is not None:
+            project["fund_infos"] = payload.get("fund_infos") or {}
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
@@ -2243,6 +2577,103 @@ class Handler(BaseHTTPRequestHandler):
                 "header_mode": preview["header_mode"],
             },
         )
+
+    def _handle_fund_info_upload_doc(self):
+        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers,
+                                environ={"REQUEST_METHOD":"POST","CONTENT_TYPE":self.headers.get("Content-Type")})
+        project_id = form.getfirst("project_id") or ""
+        fund_name  = form.getfirst("fund_name") or ""
+        doc_type   = form.getfirst("doc_type") or ""
+        f = form["file"] if "file" in form else None
+        if not f or not getattr(f, "filename", None):
+            raise ValueError("No file provided")
+        from project_store import project_dir as _pdir
+        dest_dir = _pdir(project_id) / "fund_docs" if project_id else Path("/tmp")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        safe = Path(f.filename).name
+        dest = dest_dir / f"{fund_name}_{doc_type}_{safe}".replace(" ", "_")
+        dest.write_bytes(f.file.read())
+        self._send_json(200, {"path": str(dest)})
+
+    def _handle_fund_info_upload_proj_files(self):
+        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers,
+                                environ={"REQUEST_METHOD":"POST","CONTENT_TYPE":self.headers.get("Content-Type")})
+        project_id = form.getfirst("project_id") or ""
+        items = form["files"] if "files" in form else []
+        if not isinstance(items, list): items = [items]
+        from project_store import project_dir as _pdir
+        dest_dir = _pdir(project_id) / "project_docs" if project_id else Path("/tmp")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for item in items:
+            if not getattr(item, "filename", None): continue
+            dest = dest_dir / Path(item.filename).name
+            dest.write_bytes(item.file.read())
+            paths.append(str(dest))
+        self._send_json(200, {"paths": paths})
+
+    def _handle_fund_info_parse(self):
+        import fund_info as fi_mod
+        payload = self._read_json()
+        fund_name = payload.get("fund_name") or ""
+        doc_type  = payload.get("doc_type") or ""
+        file_path = payload.get("file_path") or ""
+        api_key   = payload.get("api_key") or ""
+        if not file_path or not Path(file_path).exists():
+            raise ValueError(f"File not found: {file_path}")
+        if not api_key:
+            raise ValueError("OpenAI API key required")
+        if doc_type == "quarterly_letter":
+            result = fi_mod.parse_quarterly_letter(file_path, api_key, fund_name)
+        elif doc_type == "afs":
+            result = fi_mod.parse_afs(file_path, api_key, fund_name)
+        elif doc_type == "lpa":
+            result = fi_mod.parse_lpa(file_path, api_key, fund_name)
+        else:
+            raise ValueError(f"Unknown doc_type: {doc_type}")
+        if "error" in result:
+            raise ValueError(result["error"])
+        self._send_json(200, {"fields": result})
+
+    def _handle_fund_info_parse_project(self):
+        import fund_info as fi_mod
+        payload = self._read_json()
+        file_paths = payload.get("file_paths") or []
+        fund_names = payload.get("fund_names") or []
+        api_key    = payload.get("api_key") or ""
+        if not file_paths: raise ValueError("No project files provided")
+        if not api_key:    raise ValueError("OpenAI API key required")
+        results = fi_mod.parse_project_files(file_paths, api_key, fund_names)
+        self._send_json(200, {"results": results})
+
+    def _handle_project_update_fund_info(self):
+        payload = self._read_json()
+        project_id = payload.get("project_id")
+        if not project_id: raise ValueError("Project id required")
+        project = load_project(project_id)
+        project["project_name"] = payload.get("project_name") or project.get("project_name") or "Untitled project"
+        if payload.get("fund_infos") is not None:
+            project["fund_infos"] = payload.get("fund_infos") or {}
+        if payload.get("memo_file_path") is not None:
+            project["memo_file_path"] = payload.get("memo_file_path") or ""
+        memo_path = project.get("memo_file_path") or ""
+        if not memo_path:
+            raise ValueError("Point to a memo file first.")
+        if not Path(memo_path).exists():
+            raise ValueError(f"Memo file not found: {memo_path}")
+        payload_funds = self._normalize_funds_payload(payload.get("funds"))
+        project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
+        saved = save_project(project)
+        result = compute_project_exposure(payload_funds, UPLOADS,
+                    parse_mapping_rules(project.get("rules") or ""),
+                    issuer_aliases=project.get("issuer_aliases") or "",
+                    force_splits=project.get("force_splits") or "")
+        try:
+            from memo_export import update_sections_in_file
+            update_sections_in_file(memo_path, result, sections=("fund_info",), project=saved)
+        except PermissionError:
+            raise ValueError("Memo is open in Word — close it and try again.")
+        self._send_json(200, {"ok": True, "memo_file_path": memo_path})
 
     def _handle_download_positions_excel(self):
         import io
