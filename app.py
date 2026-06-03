@@ -1417,10 +1417,34 @@ HTML = r"""<!DOCTYPE html>
         .map(([family, title]) => renderCategoryCard(family, title, data.categories[family]))
         .join('') + '</div>';
       const topPositionsHtml = renderBarCard('Top positions', data.top_positions.slice(0, 15));
+      const concentrationTableHtml = renderConcentrationTable(data);
       const mergesHtml = renderMergesCard(data.position_merges || [], data.position_merge_suggestions || []);
       const fundTableHtml = renderFundTable(data.funds);
 
-      resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
+      resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + concentrationTableHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
+    }
+
+    function renderConcentrationTable(data) {
+      const profiles = data.fund_profiles || [];
+      const top = data.top_concentration || {};
+      function fundConc(fp) {
+        const pos = fp.position_exposure || [];
+        const vals = pos.map((p) => Number(p.value || p.percentage || 0)).sort((a, b) => b - a);
+        const sum = (n) => vals.slice(0, n).reduce((a, b) => a + b, 0);
+        return { top_1: sum(1), top_3: sum(3), top_5: sum(5), top_10: sum(10), remaining: Math.max(0, 1 - sum(10)) };
+      }
+      const rows = [
+        ['Total', top.top_1, top.top_3, top.top_5, top.top_10, top.remaining],
+        ...profiles.map((fp) => {
+          const c = fundConc(fp);
+          return [fp.fund_name || fp.filename || 'Fund', c.top_1, c.top_3, c.top_5, c.top_10, c.remaining];
+        }),
+      ];
+      const thead = '<thead><tr><th>Top Positions</th><th>Top 1</th><th>Top 3</th><th>Top 5</th><th>Top 10</th><th>Remaining</th></tr></thead>';
+      const tbody = '<tbody>' + rows.map((r) =>
+        '<tr>' + r.map((v, i) => `<td>${i === 0 ? escapeHtml(String(v)) : pct(v)}</td>`).join('') + '</tr>'
+      ).join('') + '</tbody>';
+      return `<div class="chart-card"><h3>Top Positions</h3><div class="preview-wrap"><table>${thead}${tbody}</table></div></div>`;
     }
 
     function renderMergesCard(merges, suggestions) {

@@ -1,15 +1,10 @@
 """
-Update the memo's *native* Office charts in place by editing the chart-part XML
-caches inside the .docx — no python-docx (it can't touch chart XML), no Office
-automation. Word renders pie charts straight from the <c:numCache>/<c:strCache>
-in word/charts/chartN.xml (these memos carry no embedded workbook), so rewriting
-those caches is sufficient and preserves all designed styling (slice colors,
-manual label positions, fonts).
+Update native Office pie charts in the .docx by editing chart-part XML caches.
+No python-docx, no Office automation. Word renders from <c:numCache>/<c:strCache>.
 
-Strategy: keep each chart's existing slice structure and map the blended exposure
-onto the chart's existing categories *by name*, rewriting only the numeric value
-and the label text (e.g. "Corporate Lending (94%)" -> "Corporate Lending (75%)").
-Categories present in the chart but absent from the blend are set to 0%.
+Rebuild approach: instead of mapping onto existing template slots, we rebuild the
+series data to exactly match the blend categories (non-zero values). This means
+new categories (e.g. ABS) are added and removed categories vanish cleanly.
 """
 from __future__ import annotations
 
@@ -23,20 +18,50 @@ from typing import Any, Callable, Dict, List, Sequence
 from lxml import etree
 
 C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
-NS = {"c": C_NS}
+A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+NS = {"c": C_NS, "a": A_NS}
 
-# Which chart part renders which blended dimension (Project Balance memo).
 DEFAULT_CHART_MAP: Dict[str, str] = {
     "word/charts/chart2.xml": "asset_class",
     "word/charts/chart1.xml": "security_type",
     "word/charts/chart3.xml": "geography",
 }
 
+# Colors by canonical category name (lower). Grouped by asset class family.
+_CAT_COLORS: Dict[str, str] = {
+    # Asset class
+    "corporate lending": "09304F",
+    "abs": "8B5E3C",
+    "special situations": "4D7A3E",
+    # Corporate Lending security types
+    "direct lending": "09304F",
+    "other senior lending": "1f5f74",
+    "opportunistic / junior": "4887B2",
+    "distressed": "7BAFC4",
+    "corporate equity": "A8C8D4",
+    # ABS security types
+    "clos": "8B5E3C",
+    "regulatory capital": "A0724A",
+    "commercial re (debt)": "B58A60",
+    "residential re": "C9A07A",
+    "consumer": "D4B090",
+    "hard assets": "5e3a1a",
+    "specialty lending": "7A4F2A",
+    # Special Situations security types
+    "commercial re (equity)": "4D7A3E",
+    "commercial re (non-perf)": "6B9A5A",
+    "equity": "5d7d4e",
+    # Geography
+    "north america": "4f6fb5",
+    "europe": "c27c3d",
+    "other": "8a4f69",
+}
+_DEFAULT_COLORS = ["09304F", "4887B2", "8B5E3C", "5d7d4e", "c27c3d", "8a4f69", "7BAFC4", "A0724A", "6B9A5A"]
+
 _PCT_SUFFIX = re.compile(r"\s*\(\s*-?\d+(?:\.\d+)?\s*%\s*\)\s*$")
 
 
 def base_label(text: str) -> str:
-    """Strip a trailing ' (NN%)' from a category label."""
     return _PCT_SUFFIX.sub("", text or "").strip()
 
 
@@ -44,143 +69,115 @@ def _default_label(base: str, value: float) -> str:
     return f"{base} ({round(value * 100)}%)"
 
 
-def _blend_lookup(items: Sequence[Dict[str, Any]]) -> Dict[str, float]:
-    """label (lowercased) -> share. Uses 'percentage' if present, else 'value'."""
-    out: Dict[str, float] = {}
-    for item in items or []:
-        label = base_label(str(item.get("label", "")))
-        if not label:
-            continue
-        val = item.get("percentage")
-        if val is None:
-            val = item.get("value", 0.0)
-        try:
-            out[label.lower()] = float(val)
-        except (TypeError, ValueError):
-            continue
-    return out
+def _slice_color(label: str, index: int) -> str:
+    return _CAT_COLORS.get(label.lower().strip(), _DEFAULT_COLORS[index % len(_DEFAULT_COLORS)])
+
+
+def _make_dpt(idx: int, color: str) -> etree._Element:
+    """Build a <c:dPt> element with a solid fill color."""
+    C = C_NS
+    dp = etree.Element(f"{{{C}}}dPt")
+    etree.SubElement(dp, f"{{{C}}}idx").set("val", str(idx))
+    etree.SubElement(dp, f"{{{C}}}bubble3D").set("val", "0")
+    etree.SubElement(dp, f"{{{C}}}explosion").set("val", "0")
+    spPr = etree.SubElement(dp, f"{{{C}}}spPr")
+    solidFill = etree.SubElement(spPr, f"{{{A_NS}}}solidFill")
+    etree.SubElement(solidFill, f"{{{A_NS}}}srgbClr").set("val", color)
+    ln = etree.SubElement(spPr, f"{{{A_NS}}}ln")
+    etree.SubElement(ln, f"{{{A_NS}}}noFill")
+    return dp
 
 
 def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
                       label_fmt: Callable[[str, float], str]) -> tuple[bytes, List[str]]:
     """
-    Map the blend onto the pie's existing category slots by name, then:
-      - drop any category whose value is *legitimately 0* (slice + its dPt color +
-        its dLbl label are removed; surviving slices are re-indexed so they keep
-        their original colors and label positions);
-      - keep categories with value > 0 even if they round to 0% (label shows "(0%)").
+    Rebuild the pie series to exactly match the non-zero blend categories.
+    Adds new categories (e.g. ABS) and removes absent ones. Assigns colors by
+    category name. A >0 value that rounds to 0% is kept and labeled '(0%)'.
     """
-    lookup = _blend_lookup(items)
+    keep = [(base_label(str(it.get("label", ""))),
+             float(it.get("percentage") or it.get("value") or 0))
+            for it in (items or [])
+            if float(it.get("percentage") or it.get("value") or 0) > 0]
+
     root = etree.fromstring(xml_bytes)
     ser = root.find(".//c:ser", NS)
-    if ser is None:
-        return xml_bytes, ["no <c:ser>"]
+    if ser is None or not keep:
+        return xml_bytes, ["no <c:ser> or no non-zero items"]
 
     cat_cache = ser.find(".//c:cat//c:strCache", NS)
     val_cache = ser.find(".//c:val//c:numCache", NS)
     if cat_cache is None or val_cache is None:
-        return xml_bytes, ["no cache"]
-    cat_pts = cat_cache.findall("c:pt", NS)
-    val_pts = val_cache.findall("c:pt", NS)
-    dlbls = ser.find("c:dLbls", NS)
+        return xml_bytes, ["no cache nodes"]
 
-    notes: List[str] = []
-    keep: List[tuple[int, str, float]] = []   # (orig_idx, base_label, share)
-    for i, cp in enumerate(cat_pts):
-        cv = cp.find("c:v", NS)
-        base = base_label(cv.text if cv is not None else "")
-        share = lookup.get(base.lower(), 0.0)
-        if share > 0:
-            keep.append((i, base, share))
-            notes.append(f"{base}={share:.1%}")
-        else:
-            notes.append(f"{base}=drop(0)")
+    # Clear existing cat/val points
+    for pt in list(cat_cache.findall("c:pt", NS)):
+        cat_cache.remove(pt)
+    for pt in list(val_cache.findall("c:pt", NS)):
+        val_cache.remove(pt)
 
-    drop_set = {i for i in range(len(cat_pts)) if i not in {oi for oi, _, _ in keep}}
-    orig_to_new = {oi: new for new, (oi, _, _) in enumerate(keep)}
-
-    # remove dropped category / value points
-    for i in sorted(drop_set, reverse=True):
-        cat_cache.remove(cat_pts[i])
-        if i < len(val_pts):
-            val_cache.remove(val_pts[i])
-
-    # fix ptCount
+    # Update ptCount
     for cache in (cat_cache, val_cache):
         pc = cache.find("c:ptCount", NS)
         if pc is not None:
             pc.set("val", str(len(keep)))
 
-    # rewrite values + labels and re-index surviving points (now in keep order)
-    new_cat_pts = cat_cache.findall("c:pt", NS)
-    new_val_pts = val_cache.findall("c:pt", NS)
-    for new_i, (oi, base, share) in enumerate(keep):
-        cp = new_cat_pts[new_i]
-        cp.set("idx", str(new_i))
-        cv = cp.find("c:v", NS)
-        if cv is not None:
-            cv.text = label_fmt(base, share)
-        if new_i < len(new_val_pts):
-            vp = new_val_pts[new_i]
-            vp.set("idx", str(new_i))
-            vv = vp.find("c:v", NS)
-            if vv is not None:
-                vv.text = repr(float(share))
+    # Add new points
+    for i, (base, share) in enumerate(keep):
+        cat_pt = etree.SubElement(cat_cache, f"{{{C_NS}}}pt")
+        cat_pt.set("idx", str(i))
+        cat_v = etree.SubElement(cat_pt, f"{{{C_NS}}}v")
+        cat_v.text = label_fmt(base, share)
 
-    # drop dropped slices' colors/labels; re-index survivors to match
+        val_pt = etree.SubElement(val_cache, f"{{{C_NS}}}pt")
+        val_pt.set("idx", str(i))
+        val_v = etree.SubElement(val_pt, f"{{{C_NS}}}v")
+        val_v.text = repr(float(share))
+
+    # Remove all existing dPt color nodes and rebuild
     for dp in list(ser.findall("c:dPt", NS)):
-        ie = dp.find("c:idx", NS)
-        if ie is None:
-            continue
-        oi = int(ie.get("val"))
-        if oi in drop_set:
-            ser.remove(dp)
-        elif oi in orig_to_new:
-            ie.set("val", str(orig_to_new[oi]))
+        ser.remove(dp)
+
+    # Insert dPt nodes before dLbls (or at start of ser after idx/order/spPr)
+    dlbls = ser.find("c:dLbls", NS)
+    insert_before = dlbls if dlbls is not None else ser.find("c:cat", NS)
+    for i, (base, _) in enumerate(keep):
+        dp = _make_dpt(i, _slice_color(base, i))
+        if insert_before is not None:
+            insert_before.addprevious(dp)
+        else:
+            ser.append(dp)
+
+    # Remove dLbl manual positions (they reference old indices; let Word auto-position)
     if dlbls is not None:
         for dl in list(dlbls.findall("c:dLbl", NS)):
-            ie = dl.find("c:idx", NS)
-            if ie is None:
-                continue
-            oi = int(ie.get("val"))
-            if oi in drop_set:
-                dlbls.remove(dl)
-            elif oi in orig_to_new:
-                ie.set("val", str(orig_to_new[oi]))
+            dlbls.remove(dl)
 
-    new_bytes = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-    return new_bytes, notes
+    notes = [f"{b}={v:.1%}" for b, v in keep]
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), notes
 
 
-def update_native_pies(docx_path: str | Path,
-                       blend_categories: Dict[str, Sequence[Dict[str, Any]]],
+def update_native_pies(docx_path, blend_categories: Dict[str, Sequence[Dict[str, Any]]],
                        chart_map: Dict[str, str] = DEFAULT_CHART_MAP,
                        label_fmt: Callable[[str, float], str] = _default_label) -> Dict[str, List[str]]:
-    """
-    Rewrite the native pie caches in `docx_path` in place.
-    `blend_categories` maps family name -> list of {label, value/percentage}.
-    Returns {chart_part: [per-slice notes]} for logging.
-    """
     docx_path = Path(docx_path)
-    report: Dict[str, List[str]] = {}
-
     with zipfile.ZipFile(docx_path, "r") as zin:
         names = zin.namelist()
         contents = {name: zin.read(name) for name in names}
 
+    report: Dict[str, List[str]] = {}
     for part, family in chart_map.items():
         if part not in contents:
-            report[part] = ["MISSING part"]
+            report[part] = ["MISSING"]
             continue
         items = blend_categories.get(family) or []
         if not items:
-            report[part] = [f"no blend data for '{family}' (left unchanged)"]
+            report[part] = [f"no data for '{family}'"]
             continue
         new_xml, notes = _update_chart_xml(contents[part], items, label_fmt)
         contents[part] = new_xml
         report[part] = notes
 
-    # zipfile can't edit in place; rewrite the archive preserving entry order.
     tmp_fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=str(docx_path.parent))
     import os
     os.close(tmp_fd)
