@@ -227,20 +227,61 @@ Use null for any value not found.""")
     }
 
 
+def expand_paths(paths: List[str], extensions: tuple = (".pdf",),
+                 max_files: int = 20) -> List[str]:
+    """Expand any directory paths to individual files matching extensions.
+    Scans the directory itself and one level of subdirectories."""
+    result = []
+    for p in paths:
+        path = Path(p)
+        if path.is_file() and path.suffix.lower() in extensions:
+            result.append(str(path))
+        elif path.is_dir():
+            # Top-level files
+            for f in sorted(path.iterdir()):
+                if f.is_file() and f.suffix.lower() in extensions:
+                    result.append(str(f))
+                    if len(result) >= max_files:
+                        return result
+            # One level of subdirectories
+            for sub in sorted(path.iterdir()):
+                if sub.is_dir():
+                    for f in sorted(sub.iterdir()):
+                        if f.is_file() and f.suffix.lower() in extensions:
+                            result.append(str(f))
+                            if len(result) >= max_files:
+                                return result
+    return result
+
+
 def parse_project_files(paths: List[str], api_key: str,
                         fund_names: List[str]) -> Dict[str, Dict]:
-    """Extract LP NAV, Unfunded, Commits for all funds from project-level overview files."""
+    """Extract LP NAV, Unfunded, Commits for all funds from project-level overview files.
+    Accepts individual PDF paths or directory paths (scanned for PDFs up to 1 level deep)."""
+    # Expand any directory paths to individual PDFs
+    resolved = expand_paths(paths)
+    if not resolved:
+        raise ValueError(
+            f"No PDF files found. Searched: {', '.join(paths)}.\n"
+            "Upload PDF files directly or point to a folder containing PDFs.")
+
     all_ctx = ""
-    for p in paths:
+    files_used = []
+    for p in resolved:
         try:
             pages = extract_pdf_pages(str(p))
             rel = _filter_pages(pages, ["nav", "unfunded", "commitment", "net asset",
                                          "capital account", "balance"], fallback_n=8)
-            all_ctx += _ctx(rel, 25_000) + "\n\n"
+            chunk = _ctx(rel, 25_000)
+            if chunk.strip():
+                all_ctx += f"[File: {Path(p).name}]\n{chunk}\n\n"
+                files_used.append(Path(p).name)
         except Exception:
             continue
     if not all_ctx:
-        return {}
+        raise ValueError(
+            f"Found {len(resolved)} PDF(s) but could not extract text from any of them. "
+            "They may be scanned images — try uploading the specific overview PDF directly.")
     all_ctx = all_ctx[:80_000]
 
     fund_list = ", ".join(fund_names)
@@ -256,7 +297,7 @@ Return JSON where each top-level key is exactly one of the fund names listed abo
 - "as_of": date the figures are as of
 If a fund is not found in the documents, still include its key with all null values.""")
 
-    result = {}
+    result = {"_files_used": files_used}
     for fname in fund_names:
         fd = r.get(fname) or {}
         src = " | ".join(filter(None, [fd.get("source", ""), fd.get("as_of", "")]))

@@ -1730,7 +1730,7 @@ HTML = r"""<!DOCTYPE html>
       if (!paths.length) { showError('Upload or add project files first.'); return; }
       const fundNames = (appState.result.fund_profiles || []).map(fp => fp.fund_name || fp.filename || '').filter(Boolean);
       parseProjFilesBtn.disabled = true; parseProjFilesBtn.textContent = 'Parsing…';
-      showParseSpinner(`Parsing project files for ${fundNames.length} fund(s)… (15–30 seconds)`);
+      showParseSpinner(`Scanning folder and parsing project files for ${fundNames.length} fund(s)… (15–45 seconds)`);
       try {
         const r = await fetch('/api/fund_info/parse_project', {method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -1749,7 +1749,8 @@ HTML = r"""<!DOCTYPE html>
         });
         saveFundInfos(fis);
         renderFundInfoTable();
-        hideParseSpinner(`✓ Project files parsed — ${populated} value(s) populated across ${fundNames.length} fund(s).`);
+        const filesNote = d.files_used && d.files_used.length ? ` from ${d.files_used.length} file(s): ${d.files_used.slice(0,3).join(', ')}${d.files_used.length>3?'…':''}` : '';
+        hideParseSpinner(`✓ Project files parsed — ${populated} value(s) populated across ${fundNames.length} fund(s)${filesNote}.`);
       } catch(e) { hideParseSpinner(); showError(e.message || String(e)); }
       finally { parseProjFilesBtn.disabled = false; parseProjFilesBtn.textContent = 'Parse project files'; }
     }
@@ -2669,8 +2670,9 @@ class Handler(BaseHTTPRequestHandler):
         api_key    = payload.get("api_key") or ""
         if not file_paths: raise ValueError("No project files provided")
         if not api_key:    raise ValueError("OpenAI API key required")
-        results = fi_mod.parse_project_files(file_paths, api_key, fund_names)
-        self._send_json(200, {"results": results})
+        raw = fi_mod.parse_project_files(file_paths, api_key, fund_names)
+        files_used = raw.pop("_files_used", [])
+        self._send_json(200, {"results": raw, "files_used": files_used})
 
     def _handle_project_update_fund_info(self):
         payload = self._read_json()
