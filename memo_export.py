@@ -161,6 +161,8 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
     set_next("Positions >20%", str(gt20))
     set_next("Underlying Funds", str(len(fund_profiles)))
     set_next("Underlying Investments", str(len(positions)))
+    # Format the whole summary table: center everything, Calibri 9
+    _format_table(t, center_from_col=0, font_pt=9)
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +244,10 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
 
     asset_vals = {it["label"]: float(it.get("value") or it.get("percentage") or 0)
                   for it in categories.get("asset_class", [])}
+    # Use sub_asset_class; fall back to security_type if not populated
+    sub_src = categories.get("sub_asset_class") or categories.get("security_type") or []
     sub_vals = {it["label"]: float(it.get("value") or it.get("percentage") or 0)
-                for it in categories.get("sub_asset_class", [])}
+                for it in sub_src}
 
     fund_weights = [float(f.get("weight") or 0) for f in fund_profiles]
     total_w = sum(fund_weights) or 1.0
@@ -257,7 +261,8 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
         return _fmt_pct0(m.get(label, 0.0))
 
     def fund_sub(fi: int, label: str) -> str:
-        cats = (fund_profiles[fi].get("categories") or {}).get("sub_asset_class", [])
+        fp_cats = fund_profiles[fi].get("categories") or {}
+        cats = fp_cats.get("sub_asset_class") or fp_cats.get("security_type") or []
         m = {it["label"]: float(it.get("value") or it.get("percentage") or 0) for it in cats}
         return _fmt_pct0(m.get(label, 0.0))
 
@@ -273,9 +278,17 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
             continue
         specs.append(("ac_header", [ac, "", _fmt_pct0(asset_vals.get(ac, 0.0))]
                       + [fund_ac(fi, ac) for fi in range(n_funds)]))
+        _sub_order = [
+            "Direct Lending", "Other Senior Lending", "Opportunistic / Junior",
+            "Distressed", "Corporate Equity",
+            "CLOs", "Regulatory Capital", "Commercial RE (Debt)", "Residential RE",
+            "Consumer", "Hard Assets", "Specialty Lending",
+            "Commercial RE (Equity)", "Commercial RE (Non-Perf)", "Equity",
+        ]
+        _sub_pos = {s: i for i, s in enumerate(_sub_order)}
         subs = sorted(
             [s for s, v in sub_vals.items() if _SEC_TO_AC.get(s) == ac and v > 0],
-            key=lambda s: sub_vals.get(s, 0.0), reverse=True
+            key=lambda s: _sub_pos.get(s, 999)
         )
         for sub in subs:
             specs.append(("sub", [ac, sub, _fmt_pct0(sub_vals.get(sub, 0.0))]

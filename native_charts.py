@@ -34,6 +34,26 @@ _COLOR_2 = "4887B2"   # RGB(72,135,178) – medium blue
 _COLOR_3 = "A6A6A6"   # RGB(166,166,166)– gray
 _DEFAULT_COLORS = [_COLOR_1, _COLOR_2, _COLOR_3]
 
+# Canonical order for each dimension — controls which slice appears "first" (top/left)
+_FAMILY_ORDER: Dict[str, List[str]] = {
+    "asset_class": ["Corporate Lending", "ABS", "Special Situations"],
+    "geography": ["North America", "Europe", "Other"],
+    "security_type": [
+        "Direct Lending", "Other Senior Lending", "Opportunistic / Junior",
+        "Distressed", "Corporate Equity",
+        "CLOs", "Regulatory Capital", "Commercial RE (Debt)", "Residential RE",
+        "Consumer", "Hard Assets", "Specialty Lending",
+        "Commercial RE (Equity)", "Commercial RE (Non-Perf)", "Equity",
+    ],
+    "sub_asset_class": [
+        "Direct Lending", "Other Senior Lending", "Opportunistic / Junior",
+        "Distressed", "Corporate Equity",
+        "CLOs", "Regulatory Capital", "Commercial RE (Debt)", "Residential RE",
+        "Consumer", "Hard Assets", "Specialty Lending",
+        "Commercial RE (Equity)", "Commercial RE (Non-Perf)", "Equity",
+    ],
+}
+
 # Security type → asset class (so security-type slices inherit asset-class colors)
 _SEC_TO_AC = {
     "direct lending": "corporate lending",
@@ -102,11 +122,13 @@ def _make_dpt(idx: int, color: str) -> etree._Element:
     etree.SubElement(dp, f"{{{C}}}idx").set("val", str(idx))
     etree.SubElement(dp, f"{{{C}}}bubble3D").set("val", "0")
     etree.SubElement(dp, f"{{{C}}}explosion").set("val", "0")
-    spPr = etree.SubElement(dp, f"{{{C}}}spPr")
+    spPr = etree.SubElement(dp, f"{{{C_NS}}}spPr")
     solidFill = etree.SubElement(spPr, f"{{{A_NS}}}solidFill")
     etree.SubElement(solidFill, f"{{{A_NS}}}srgbClr").set("val", color)
     ln = etree.SubElement(spPr, f"{{{A_NS}}}ln")
-    etree.SubElement(ln, f"{{{A_NS}}}noFill")
+    ln.set("w", "19050")
+    ln_fill = etree.SubElement(ln, f"{{{A_NS}}}solidFill")
+    etree.SubElement(ln_fill, f"{{{A_NS}}}srgbClr").set("val", "FFFFFF")
     return dp
 
 
@@ -192,10 +214,15 @@ def update_native_pies(docx_path, blend_categories: Dict[str, Sequence[Dict[str,
         if part not in contents:
             report[part] = ["MISSING"]
             continue
-        items = blend_categories.get(family) or []
+        items = list(blend_categories.get(family) or [])
         if not items:
             report[part] = [f"no data for '{family}'"]
             continue
+        # Sort by canonical order for this dimension; unknown labels go to the end
+        order = _FAMILY_ORDER.get(family, [])
+        order_lower = {lbl.lower(): i for i, lbl in enumerate(order)}
+        items = sorted(items, key=lambda it: order_lower.get(
+            base_label(str(it.get("label", ""))).lower(), len(order)))
         new_xml, notes = _update_chart_xml(contents[part], items, label_fmt)
         contents[part] = new_xml
         report[part] = notes
