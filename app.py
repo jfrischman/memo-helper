@@ -477,6 +477,14 @@ HTML = r"""<!DOCTYPE html>
             <div id="projFilesList" class="small-note" style="margin-top:4px;"></div>
           </div>
         </div>
+        <div class="section-gap" id="fundInfoParseStatus" style="display:none;align-items:center;gap:10px;padding:10px 0;">
+          <svg width="22" height="22" viewBox="0 0 22 22" style="flex-shrink:0;animation:fi-spin 1s linear infinite">
+            <circle cx="11" cy="11" r="9" fill="none" stroke="#d9d4c9" stroke-width="3"/>
+            <path d="M11 2 A9 9 0 0 1 20 11" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round"/>
+          </svg>
+          <span id="fundInfoParseMsg" style="font-size:13px;color:var(--muted)">Parsing…</span>
+        </div>
+        <style>@keyframes fi-spin{to{transform:rotate(360deg)}}</style>
         <div class="section-gap" id="fundInfoTableWrap">
           <div class="small-note">Add funds and parse documents to populate the fund information table.</div>
         </div>
@@ -647,6 +655,17 @@ HTML = r"""<!DOCTYPE html>
     const fundInfoTableWrap = document.getElementById('fundInfoTableWrap');
     const fundDocsList = document.getElementById('fundDocsList');
     const parseProjFilesBtn = document.getElementById('parseProjFilesBtn');
+    const fundInfoParseStatus = document.getElementById('fundInfoParseStatus');
+    const fundInfoParseMsg = document.getElementById('fundInfoParseMsg');
+
+    function showParseSpinner(msg) {
+      fundInfoParseMsg.textContent = msg || 'Parsing… (15–45 seconds)';
+      fundInfoParseStatus.style.display = 'flex';
+    }
+    function hideParseSpinner(msg) {
+      fundInfoParseStatus.style.display = 'none';
+      if (msg) setProjectStatus(msg);
+    }
     const projectStatus = document.getElementById('projectStatus');
     const liveUpdateToggle = document.getElementById('liveUpdateToggle');
     const addFundBtn = document.getElementById('addFundBtn');
@@ -1680,6 +1699,8 @@ HTML = r"""<!DOCTYPE html>
       if (!apiKey) { showError('Enter your OpenAI API key first.'); return; }
       const origText = btn.textContent;
       btn.disabled = true; btn.textContent = 'Parsing…';
+      const docLabel = {'quarterly_letter':'quarterly letter','afs':'AFS','lpa':'LPA'}[dtype] || dtype;
+      showParseSpinner(`Parsing ${docLabel} for ${fname}… (15–45 seconds)`);
       showError('');
       try {
         const r = await fetch('/api/fund_info/parse', {method:'POST',
@@ -1687,7 +1708,6 @@ HTML = r"""<!DOCTYPE html>
           body:JSON.stringify({project_id:appState.project.project_id,fund_name:fname,doc_type:dtype,file_path:path,api_key:apiKey})});
         const d = await r.json();
         if (!r.ok) { showError(d.error || 'Parse failed'); return; }
-        // Merge extracted fields into fis
         const fis2 = getFundInfos();
         if (!fis2[fname]) fis2[fname] = {scale_pct:100, fields:{}};
         Object.entries(d.fields || {}).forEach(([k, v]) => {
@@ -1696,8 +1716,10 @@ HTML = r"""<!DOCTYPE html>
         });
         saveFundInfos(fis2);
         renderFundInfoTable();
-        setProjectStatus(`Parsed ${dtype} for ${fname}.`);
-      } finally { btn.disabled = false; btn.textContent = origText; }
+        const populated = Object.entries(d.fields || {}).filter(([,v])=>v&&v.value!=null).map(([k])=>k).join(', ');
+        hideParseSpinner(`✓ Parsed ${docLabel} for ${fname}${populated ? ' — populated: ' + populated : ''}.`);
+      } catch(e) { hideParseSpinner(); showError(e.message || String(e)); }
+      finally { btn.disabled = false; btn.textContent = origText; }
     }
 
     async function parseProjFiles() {
@@ -1708,6 +1730,7 @@ HTML = r"""<!DOCTYPE html>
       if (!paths.length) { showError('Upload or add project files first.'); return; }
       const fundNames = (appState.result.fund_profiles || []).map(fp => fp.fund_name || fp.filename || '').filter(Boolean);
       parseProjFilesBtn.disabled = true; parseProjFilesBtn.textContent = 'Parsing…';
+      showParseSpinner(`Parsing project files for ${fundNames.length} fund(s)… (15–30 seconds)`);
       try {
         const r = await fetch('/api/fund_info/parse_project', {method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -1715,17 +1738,20 @@ HTML = r"""<!DOCTYPE html>
         const d = await r.json();
         if (!r.ok) { showError(d.error || 'Parse failed'); return; }
         const fis = getFundInfos();
+        let populated = 0;
         Object.entries(d.results || {}).forEach(([fname, extracted]) => {
           if (!fis[fname]) fis[fname] = {scale_pct:100, fields:{}};
           Object.entries(extracted || {}).forEach(([k, v]) => {
             if (!fis[fname].fields[k]) fis[fname].fields[k] = {value:null,source:null,override:null};
             Object.assign(fis[fname].fields[k], v);
+            if (v && v.value != null) populated++;
           });
         });
         saveFundInfos(fis);
         renderFundInfoTable();
-        setProjectStatus('Project files parsed.');
-      } finally { parseProjFilesBtn.disabled = false; parseProjFilesBtn.textContent = 'Parse project files'; }
+        hideParseSpinner(`✓ Project files parsed — ${populated} value(s) populated across ${fundNames.length} fund(s).`);
+      } catch(e) { hideParseSpinner(); showError(e.message || String(e)); }
+      finally { parseProjFilesBtn.disabled = false; parseProjFilesBtn.textContent = 'Parse project files'; }
     }
 
     async function updateFundInfo() {
