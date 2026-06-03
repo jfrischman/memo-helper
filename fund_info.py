@@ -140,91 +140,131 @@ def _gpt(api_key: str, prompt: str, model: str = "gpt-4o") -> Dict:
 # Extraction functions
 # ---------------------------------------------------------------------------
 
-def parse_quarterly_letter(path: str, api_key: str, fund_name: str = "") -> Dict:
-    """Extract IRR, TVPI, RVPI, DPI from a quarterly letter PDF."""
-    pages = extract_pdf_pages(path)
-    rel = _filter_pages(pages, ["net irr", "tvpi", "rvpi", "dpi", "performance",
-                                 "return", "moic", "multiple"])
-    ctx = _ctx(rel)
-    r = _gpt(api_key, f"""Extract performance metrics for {fund_name or 'the fund'} from this quarterly letter.
+_COMPREHENSIVE_PROMPT = """Extract all available fund information for {fund} from this document.
 
 {ctx}
 
-Return JSON with exactly these keys:
+Return JSON with these exact keys (null for any not found in this document):
 - "irr": since-inception net IRR as "X.X%" (e.g. "15.0%")
 - "tvpi": Total Value to Paid-In as "X.XXx" (e.g. "1.20x")
 - "rvpi": Remaining Value to Paid-In as "X.XXx"
 - "dpi": Distributions to Paid-In as "X.XXx"
-- "irr_source": exact quoted text and page number where IRR was found
-- "tvpi_source": exact quoted text and page number where TVPI was found
-- "as_of": period/date these metrics are as of (e.g. "Q4 2025" or "December 31, 2025")
-Use null for any value not found.""")
+- "leverage": interest-bearing liabilities / net assets as "X.X%" (exclude tax liabilities; "0.0%" if no borrowings)
+- "lp_nav": LP/GCM stake NAV in millions as a number
+- "unfunded": unfunded commitments in millions as a number
+- "commits": total commitments in millions as a number
+- "invest_end": investment period end date as "Mmm-YY" (e.g. "Feb-27")
+- "term_end": fund base termination date EXCLUDING extensions as "Mmm-YY"
+- "extensions": extension provisions as "N GP" or "N LPAC" or "N GP, N LPAC"
+- "perpetuity": true if further extensions beyond stated ones are possible, false otherwise
+- "perpetuity_note": one-sentence description if perpetuity=true, else null
+- "as_of": date the performance / NAV data is as of
+- "sources": object mapping each populated key to a brief note (file section + quote)"""
 
+
+def _comprehensive_extract(ctx: str, api_key: str, fund_name: str) -> Dict:
+    """Run the comprehensive extraction prompt and return structured field dict."""
+    r = _gpt(api_key, _COMPREHENSIVE_PROMPT.format(
+        fund=fund_name or "the fund", ctx=ctx))
     note = r.get("as_of", "")
-    return {
-        "irr":  _f(r.get("irr"),  f"{r.get('irr_source','')}{(' | '+note) if note else ''}"),
-        "tvpi": _f(r.get("tvpi"), f"{r.get('tvpi_source','')}{(' | '+note) if note else ''}"),
-        "rvpi": _f(r.get("rvpi"), note),
-        "dpi":  _f(r.get("dpi"),  note),
-    }
+    srcs = r.get("sources") or {}
 
-
-def parse_afs(path: str, api_key: str, fund_name: str = "") -> Dict:
-    """Extract financial leverage from Audited Financial Statements."""
-    pages = extract_pdf_pages(path)
-    rel = _filter_pages(pages, ["balance sheet", "statement of assets", "statement of net assets",
-                                 "credit facility", "revolving credit", "borrowings",
-                                 "partners' capital", "shareholders' equity", "net assets"])
-    ctx = _ctx(rel)
-    r = _gpt(api_key, f"""From this Audited Financial Statement for {fund_name or 'the fund'}, calculate financial leverage.
-
-{ctx}
-
-Leverage = Interest-bearing liabilities (credit facility / revolving credit / fund borrowings ONLY) divided by Net Assets / Partners' Capital.
-EXCLUDE: tax liabilities, management fee payables, redemptions payable, trade payables. Only include actual fund borrowings (credit lines, revolving facilities).
-If no borrowings exist, leverage = 0.0%.
-
-Return JSON:
-- "leverage": as "X.X%" (e.g. "83.0%")
-- "borrowings": borrowings amount used (e.g. "$50.2m credit facility")
-- "net_assets": net assets / partners' capital amount used (e.g. "$60.5m")
-- "source": page number and exact line items used
-- "as_of": balance sheet date
-Use null for leverage if cannot be determined.""")
-
-    src = " | ".join(filter(None, [r.get("source", ""), r.get("as_of", "")]))
-    return {"leverage": _f(r.get("leverage"), src)}
-
-
-def parse_lpa(path: str, api_key: str, fund_name: str = "") -> Dict:
-    """Extract investment period end, fund term, and extensions from LPA."""
-    pages = extract_pdf_pages(path)
-    rel = _filter_pages(pages, ["investment period", "term of the fund", "fund term",
-                                 "extension", "termination", "dissolution",
-                                 "lpac", "advisory committee", "limited partner advisory"])
-    ctx = _ctx(rel)
-    r = _gpt(api_key, f"""From this Limited Partnership Agreement for {fund_name or 'the fund'}, extract fund term information.
-
-{ctx}
-
-Return JSON:
-- "invest_end": investment period end as "Mmm-YY" (e.g. "Feb-27")
-- "term_end": fund base termination date EXCLUDING any extensions as "Mmm-YY"
-- "extensions": extension provisions as string. Format: count + type where type is "GP" (General Partner sole discretion) or "LPAC" (LP Advisory Committee approval required). Examples: "3 GP", "2 LPAC", "1 GP, 2 LPAC"
-- "perpetuity": true if the fund can be extended indefinitely / in perpetuity beyond stated extensions, false otherwise
-- "perpetuity_note": if perpetuity=true, brief description of the perpetuity provision (e.g. "after stated extensions, LPAC may approve additional one-year extensions")
-- "invest_end_source": exact quoted text showing investment period end
-- "term_end_source": exact quoted text showing fund termination date
-- "extensions_source": exact quoted text showing extension provisions
-Use null for any value not found.""")
+    def s(k):
+        base = srcs.get(k, "") if isinstance(srcs, dict) else ""
+        return " | ".join(filter(None, [base, note]))
 
     return {
-        "invest_end": _f(r.get("invest_end"), r.get("invest_end_source", "")),
-        "term_end":   _f(r.get("term_end"),   r.get("term_end_source", "")),
-        "extensions": _f(r.get("extensions"), r.get("extensions_source", ""),
+        "irr":        _f(r.get("irr"),        s("irr")),
+        "tvpi":       _f(r.get("tvpi"),       s("tvpi")),
+        "rvpi":       _f(r.get("rvpi"),       s("rvpi")),
+        "dpi":        _f(r.get("dpi"),        s("dpi")),
+        "leverage":   _f(r.get("leverage"),   s("leverage")),
+        "lp_nav":     _f(r.get("lp_nav"),     s("lp_nav")),
+        "unfunded":   _f(r.get("unfunded"),   s("unfunded")),
+        "commits":    _f(r.get("commits"),    s("commits")),
+        "invest_end": _f(r.get("invest_end"), s("invest_end")),
+        "term_end":   _f(r.get("term_end"),   s("term_end")),
+        "extensions": _f(r.get("extensions"), s("extensions"),
                          perpetuity=bool(r.get("perpetuity", False)),
                          perpetuity_note=r.get("perpetuity_note") or ""),
     }
+
+
+def parse_quarterly_letter(path: str, api_key: str, fund_name: str = "") -> Dict:
+    """Extract all available fund info from a quarterly letter."""
+    pages = extract_pdf_pages(path)
+    rel = _filter_pages(pages, ["net irr", "tvpi", "rvpi", "dpi", "performance",
+                                 "return", "moic", "nav", "commitment", "investment period",
+                                 "term", "extension"])
+    return _comprehensive_extract(_ctx(rel), api_key, fund_name)
+
+
+def parse_afs(path: str, api_key: str, fund_name: str = "") -> Dict:
+    """Extract all available fund info from Audited Financial Statements."""
+    pages = extract_pdf_pages(path)
+    rel = _filter_pages(pages, ["balance sheet", "statement of assets", "net assets",
+                                 "credit facility", "revolving credit", "borrowings",
+                                 "partners' capital", "irr", "tvpi", "performance",
+                                 "investment period", "term", "extension"])
+    return _comprehensive_extract(_ctx(rel), api_key, fund_name)
+
+
+_MONTH = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+_DATE  = rf"(?:{_MONTH}\s+\d{{1,2}},?\s+20\d{{2}}|20[2-9]\d)"
+
+def _extract_lpa_clauses(pages: List[Tuple[int, str]]) -> str:
+    """Regex-based extraction of the specific sentences in an LPA that mention
+    investment period dates, fund term dates, and extension provisions.
+    Returns a small focused snippet (typically < 3k chars) ready for GPT."""
+    all_text = " ".join(t for _, t in pages)
+    # Normalise whitespace
+    all_text = re.sub(r"\s+", " ", all_text)
+
+    sentence_patterns = [
+        # Investment period + date
+        rf"[^.]*[Ii]nvestment\s+[Pp]eriod[^.]*?(?:expire|terminat|end|shall\s+(?:expire|end|terminat))[^.]*?{_DATE}[^.]*\.",
+        rf"[^.]*{_DATE}[^.]*[Ii]nvestment\s+[Pp]eriod[^.]*(?:expire|terminat|end)[^.]*\.",
+        # Fund term + date
+        rf"[^.]*(?:[Tt]erm\s+of\s+the|[Ff]und\s+[Tt]erm|[Pp]artnership\s+shall\s+terminat)[^.]*?{_DATE}[^.]*\.",
+        rf"[^.]*(?:dissolv|terminat|wind\s+up)[^.]*?[Pp]artnership[^.]*?{_DATE}[^.]*\.",
+        # Extensions
+        r"[^.]*(?:one[-\s]year|[1-5][-\s]year|\b[Oo]ne\b|\b[Tt]wo\b|\b[Tt]hree\b)[^.]*(?:extension|extend)[^.]*(?:GP|LPAC|[Gg]eneral\s+[Pp]artner|[Aa]dvisory\s+[Cc]ommittee)[^.]*\.",
+        r"[^.]*(?:LPAC|[Aa]dvisory\s+[Cc]ommittee)[^.]*(?:approv|consent|elect)[^.]*(?:extend|extension)[^.]*\.",
+        r"[^.]*[Gg]eneral\s+[Pp]artner[^.]*(?:elect|option|discret)[^.]*(?:extend|extension)[^.]*\.",
+        r"[^.]*[Pp]erpetuity[^.]*\.",
+    ]
+
+    seen, clauses = set(), []
+    for pat in sentence_patterns:
+        for m in re.finditer(pat, all_text, re.S):
+            s = re.sub(r"\s+", " ", m.group()).strip()
+            if len(s) > 30 and s not in seen:
+                seen.add(s)
+                clauses.append(s)
+            if len(clauses) >= 20:
+                break
+
+    return "\n\n".join(clauses)[:8_000]
+
+
+def parse_lpa(path: str, api_key: str, fund_name: str = "") -> Dict:
+    """Extract investment period end, fund term, and extensions from LPA.
+    Uses regex pre-extraction to pull only the relevant clauses (typically < 3k chars)
+    before calling GPT — much faster than sending entire pages for long documents."""
+    pages = extract_pdf_pages(path)
+
+    # Stage 1: regex clause extraction (fast, no API cost)
+    ctx = _extract_lpa_clauses(pages)
+
+    # Stage 2: fall back to page filter if regex found nothing
+    if len(ctx) < 100:
+        rel = _filter_pages(pages, ["investment period", "term of the fund", "fund term",
+                                     "extension", "termination", "lpac",
+                                     "advisory committee", "limited partner advisory"],
+                            fallback_n=10)
+        ctx = _ctx(rel, 40_000)
+
+    return _comprehensive_extract(ctx, api_key, fund_name)
 
 
 def expand_paths(paths: List[str], extensions: tuple = (".pdf",),
@@ -287,53 +327,10 @@ def _build_context_from_paths(paths: List[str], max_chars: int = 80_000) -> tupl
 
 
 def parse_all_fields_for_fund(paths: List[str], api_key: str, fund_name: str) -> Dict:
-    """Extract ALL fund information fields from any collection of PDFs/folder.
-    One GPT call; asks for every column in the fund summary table."""
+    """Extract ALL fund information fields from any collection of PDFs/folder."""
     ctx, files_used = _build_context_from_paths(paths)
-    r = _gpt(api_key, f"""Analyze the documents below and extract all available information for the fund: {fund_name}.
-
-{ctx}
-
-Return JSON with these exact keys (use null for any not found):
-- "lp_nav": LP/GCM stake NAV in millions as a number
-- "unfunded": unfunded commitments in millions as a number
-- "commits": total commitments in millions as a number
-- "irr": since-inception net IRR as "X.X%"
-- "tvpi": Total Value to Paid-In as "X.XXx"
-- "rvpi": Remaining Value to Paid-In as "X.XXx"
-- "dpi": Distributions to Paid-In as "X.XXx"
-- "leverage": interest-bearing liabilities / net assets as "X.X%" (exclude tax liabilities; "0.0%" if no borrowings)
-- "invest_end": investment period end date as "Mmm-YY" (e.g. "Feb-27")
-- "term_end": fund base termination date EXCLUDING extensions as "Mmm-YY"
-- "extensions": extension provisions as "N GP" or "N LPAC" or "N GP, N LPAC"
-- "perpetuity": true if further extensions beyond stated ones are possible, false otherwise
-- "perpetuity_note": brief description if perpetuity=true, else null
-- "as_of": date the performance / NAV data is as of
-- "sources": object mapping each key above to a brief note on where it was found (file name + quote)""")
-
-    note = r.get("as_of", "")
-    srcs = r.get("sources") or {}
-
-    def s(k):
-        base = srcs.get(k, "") if isinstance(srcs, dict) else str(srcs)
-        return " | ".join(filter(None, [base, note]))
-
-    result = {
-        "lp_nav":     _f(r.get("lp_nav"),     s("lp_nav")),
-        "unfunded":   _f(r.get("unfunded"),   s("unfunded")),
-        "commits":    _f(r.get("commits"),    s("commits")),
-        "irr":        _f(r.get("irr"),        s("irr")),
-        "tvpi":       _f(r.get("tvpi"),       s("tvpi")),
-        "rvpi":       _f(r.get("rvpi"),       s("rvpi")),
-        "dpi":        _f(r.get("dpi"),        s("dpi")),
-        "leverage":   _f(r.get("leverage"),   s("leverage")),
-        "invest_end": _f(r.get("invest_end"), s("invest_end")),
-        "term_end":   _f(r.get("term_end"),   s("term_end")),
-        "extensions": _f(r.get("extensions"), s("extensions"),
-                         perpetuity=bool(r.get("perpetuity", False)),
-                         perpetuity_note=r.get("perpetuity_note") or ""),
-        "_files_used": files_used,
-    }
+    result = _comprehensive_extract(ctx, api_key, fund_name)
+    result["_files_used"] = files_used
     return result
 
 
