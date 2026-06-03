@@ -334,15 +334,50 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
             specs.append(("sub", [ac, sub, _fmt_pct0(sub_vals.get(sub, 0.0))]
                           + [fund_sub(fi, sub) for fi in range(n_funds)]))
 
-    # Rebuild rows from scratch (clone header tr for structure)
+    # --- Sync the table's column grid to match the required fund count ---
+    from lxml import etree as _lxml_et
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     tbl = table._tbl
+    n_cols_needed = 3 + n_funds   # Asset Class | Sub-Asset Class | Total | fund...
+
+    tblGrid = tbl.find(f"{{{W}}}tblGrid")
+    if tblGrid is not None:
+        existing = tblGrid.findall(f"{{{W}}}gridCol")
+        n_cols_current = len(existing)
+        if n_cols_needed != n_cols_current:
+            # Derive a sensible width for the fund columns from the last existing one
+            fund_w = existing[-1].get(f"{{{W}}}w", "1400") if existing else "1400"
+            # Remove all and rebuild with correct count
+            for gc in list(existing):
+                tblGrid.remove(gc)
+            # Approximate widths: issuer col wide, sub-asset wide, then narrower numerics
+            col_widths = ["3200", "2600"] + ["1200"] * (1 + n_funds)
+            for w in col_widths[:n_cols_needed]:
+                gc = _lxml_et.SubElement(tblGrid, f"{{{W}}}gridCol")
+                gc.set(f"{{{W}}}w", w)
+
+    # --- Build a prototype cell (copy tcPr from a data cell in the original row) ---
     header_tr = list(tbl.tr_lst)[0]
+    orig_tcs = header_tr.findall(f"{{{W}}}tc")
+    proto_tc = copy.deepcopy(orig_tcs[2]) if len(orig_tcs) > 2 else copy.deepcopy(orig_tcs[-1])
+    # Clear text content from the prototype, keep only tcPr
+    for p_el in list(proto_tc.findall(f"{{{W}}}p")):
+        proto_tc.remove(p_el)
+    empty_p = _lxml_et.SubElement(proto_tc, f"{{{W}}}p")
+
+    def _make_tr(n_cells: int) -> "_lxml_et._Element":
+        tr = _lxml_et.Element(f"{{{W}}}tr")
+        for _ in range(n_cells):
+            tr.append(copy.deepcopy(proto_tc))
+        return tr
+
+    # Remove all existing rows, then add fresh rows with the correct cell count
     for tr in list(tbl.tr_lst):
         tbl.remove(tr)
     for _ in specs:
-        tbl.append(copy.deepcopy(header_tr))
+        tbl.append(_make_tr(n_cols_needed))
 
-    # Fill values with appropriate formatting per row type
+    # --- Fill values with appropriate formatting per row type ---
     for row_i, (rtype, vals) in enumerate(specs):
         row = table.rows[row_i]
         is_ac_header = (rtype == "ac_header")
