@@ -65,7 +65,7 @@ def _fmt_money(value: float) -> str:
 
 
 def _set_cell_text(cell, text: str, align: Optional[WD_ALIGN_PARAGRAPH] = None,
-                   bold: bool = False, font_pt: int = 8):
+                   bold: bool = False, italic: bool = False, font_pt: int = 8):
     cell.text = str(text)
     for p in cell.paragraphs:
         if align is not None:
@@ -75,6 +75,8 @@ def _set_cell_text(cell, text: str, align: Optional[WD_ALIGN_PARAGRAPH] = None,
             run.font.size = Pt(font_pt)
             if bold:
                 run.font.bold = True
+            if italic:
+                run.font.italic = True
 
 
 def _set_cell_shading(cell, fill_hex: str = "D9D9D9"):
@@ -227,10 +229,14 @@ def _rebuild_concentration_table(table, result: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
-    """Rebuild the Asset Type By Fund table dynamically.
-    Structure: Asset Class (gray header) | Sub-Asset Class | Total | fund1 | fund2 ...
-    Shows only asset classes that exist in the blend; sub-rows show present sub-types.
+    """Rebuild the Asset Type By Fund table to match memo format:
+    - Column header row (Asset Class | Sub-Asset Class | Total | fund...)
+    - LP NAV row
+    - Gray + bold asset class header row for each present asset class
+    - Italic sub-rows for each present security type under that asset class
+    Dynamic: rows added/removed as security types change; fund columns follow fund count.
     """
+    import copy
     categories = result.get("categories") or {}
     fund_profiles = result.get("fund_profiles") or []
 
@@ -242,6 +248,8 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
     fund_weights = [float(f.get("weight") or 0) for f in fund_profiles]
     total_w = sum(fund_weights) or 1.0
     fund_weight_pcts = [w / total_w for w in fund_weights]
+    n_funds = len(fund_profiles)
+    fund_names = [str(fp.get("fund_name") or "Fund") for fp in fund_profiles]
 
     def fund_ac(fi: int, label: str) -> str:
         cats = (fund_profiles[fi].get("categories") or {}).get("asset_class", [])
@@ -253,63 +261,54 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
         m = {it["label"]: float(it.get("value") or it.get("percentage") or 0) for it in cats}
         return _fmt_pct0(m.get(label, 0.0))
 
-    n_funds = len(fund_profiles)
-    fund_names = [str(fp.get("fund_name") or "Fund") for fp in fund_profiles]
+    # Row specs: (row_type, values)
+    # row_type: "header" | "lpnav" | "ac_header" | "sub"
+    specs: List[tuple] = []
+    specs.append(("header", ["Asset Class", "Sub-Asset Class", "Total"] + fund_names))
+    specs.append(("lpnav",  ["LP NAV", "", "100%"] + [_fmt_pct0(w) for w in fund_weight_pcts]))
 
-    # Build row specs: (is_header, col_values, is_gray)
-    # Header row: Asset Class | Sub-Asset Class | Total | fund...
-    specs: List[tuple] = []  # (is_gray, values)
-    specs.append((False, ["Asset Class", "Sub-Asset Class", "Total"] + fund_names))
-
-    # LP NAV row
-    specs.append((False, ["LP NAV", "", "100%"] + [_fmt_pct0(w) for w in fund_weight_pcts]))
-
+    present_acs = {_SEC_TO_AC.get(s, "") for s in sub_vals}
     for ac in _ASSET_CLASS_ORDER:
-        if ac not in asset_vals and ac not in {_SEC_TO_AC.get(s, "") for s in sub_vals}:
+        if ac not in asset_vals and ac not in present_acs:
             continue
-        # Gray asset class header row
-        specs.append((True, [ac, "", _fmt_pct0(asset_vals.get(ac, 0.0))]
+        specs.append(("ac_header", [ac, "", _fmt_pct0(asset_vals.get(ac, 0.0))]
                       + [fund_ac(fi, ac) for fi in range(n_funds)]))
-        # Sub-asset rows for this asset class
         subs = sorted(
             [s for s, v in sub_vals.items() if _SEC_TO_AC.get(s) == ac and v > 0],
             key=lambda s: sub_vals.get(s, 0.0), reverse=True
         )
         for sub in subs:
-            specs.append((False, [ac, sub, _fmt_pct0(sub_vals.get(sub, 0.0))]
+            specs.append(("sub", [ac, sub, _fmt_pct0(sub_vals.get(sub, 0.0))]
                           + [fund_sub(fi, sub) for fi in range(n_funds)]))
 
-    # Rebuild table rows
+    # Rebuild rows from scratch (clone header tr for structure)
     tbl = table._tbl
-    import copy
     header_tr = list(tbl.tr_lst)[0]
-
-    # Remove all existing rows
     for tr in list(tbl.tr_lst):
         tbl.remove(tr)
+    for _ in specs:
+        tbl.append(copy.deepcopy(header_tr))
 
-    # Add new rows
-    for is_gray, vals in specs:
-        new_tr = copy.deepcopy(header_tr)
-        tbl.append(new_tr)
-
-    # Now fill values
-    for row_i, (is_gray, vals) in enumerate(specs):
+    # Fill values with appropriate formatting per row type
+    for row_i, (rtype, vals) in enumerate(specs):
         row = table.rows[row_i]
-        while len(row.cells) < len(vals):
-            # extend row if needed (shouldn't happen normally)
-            break
+        is_ac_header = (rtype == "ac_header")
+        is_sub = (rtype == "sub")
+        is_col_header = (rtype == "header")
+
         for ci, val in enumerate(vals):
             if ci >= len(row.cells):
                 break
             align = WD_ALIGN_PARAGRAPH.CENTER if ci >= 2 else None
-            _set_cell_text(row.cells[ci], val, align=align)
+            bold = is_ac_header or is_col_header
+            italic = is_sub
+            _set_cell_text(row.cells[ci], val, align=align, bold=bold, italic=italic)
             row.cells[ci].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            if is_gray:
+            if is_ac_header:
                 _set_cell_shading(row.cells[ci], "D9D9D9")
-            if ci == 1:
-                row.cells[ci].width = Inches(1.9)
-                _set_cell_no_wrap(row.cells[ci])
+        if ci == 1 and ci < len(row.cells):
+            row.cells[1].width = Inches(1.9)
+            _set_cell_no_wrap(row.cells[1])
 
 
 def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:

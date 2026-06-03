@@ -27,36 +27,49 @@ DEFAULT_CHART_MAP: Dict[str, str] = {
     "word/charts/chart3.xml": "geography",
 }
 
-# Colors by canonical category name (lower). Grouped by asset class family.
-_CAT_COLORS: Dict[str, str] = {
-    # Asset class
-    "corporate lending": "09304F",
-    "abs": "8B5E3C",
-    "special situations": "4D7A3E",
-    # Corporate Lending security types
-    "direct lending": "09304F",
-    "other senior lending": "1f5f74",
-    "opportunistic / junior": "4887B2",
-    "distressed": "7BAFC4",
-    "corporate equity": "A8C8D4",
-    # ABS security types
-    "clos": "8B5E3C",
-    "regulatory capital": "A0724A",
-    "commercial re (debt)": "B58A60",
-    "residential re": "C9A07A",
-    "consumer": "D4B090",
-    "hard assets": "5e3a1a",
-    "specialty lending": "7A4F2A",
-    # Special Situations security types
-    "commercial re (equity)": "4D7A3E",
-    "commercial re (non-perf)": "6B9A5A",
-    "equity": "5d7d4e",
-    # Geography
-    "north america": "4f6fb5",
-    "europe": "c27c3d",
-    "other": "8a4f69",
+# The three memo colors in order: Corporate Lending / ABS / Special Situations.
+# Geography and other dims use the same three in order.
+_COLOR_1 = "09304F"   # RGB(9,48,79)   – dark navy
+_COLOR_2 = "4887B2"   # RGB(72,135,178) – medium blue
+_COLOR_3 = "A6A6A6"   # RGB(166,166,166)– gray
+_DEFAULT_COLORS = [_COLOR_1, _COLOR_2, _COLOR_3]
+
+# Security type → asset class (so security-type slices inherit asset-class colors)
+_SEC_TO_AC = {
+    "direct lending": "corporate lending",
+    "other senior lending": "corporate lending",
+    "opportunistic / junior": "corporate lending",
+    "distressed": "corporate lending",
+    "corporate equity": "corporate lending",
+    "traditional dl": "corporate lending",
+    "clos": "abs",
+    "regulatory capital": "abs",
+    "commercial re (debt)": "abs",
+    "residential re": "abs",
+    "consumer": "abs",
+    "hard assets": "abs",
+    "specialty lending": "abs",
+    "commercial re (equity)": "special situations",
+    "commercial re (non-perf)": "special situations",
+    "equity": "special situations",
+    "equity*": "special situations",
 }
-_DEFAULT_COLORS = ["09304F", "4887B2", "8B5E3C", "5d7d4e", "c27c3d", "8a4f69", "7BAFC4", "A0724A", "6B9A5A"]
+
+_AC_COLOR = {
+    "corporate lending": _COLOR_1,
+    "abs": _COLOR_2,
+    "special situations": _COLOR_3,
+}
+
+# Explicit color map for top-level asset classes and geography
+_CAT_COLORS: Dict[str, str] = {
+    "corporate lending": _COLOR_1,
+    "abs": _COLOR_2,
+    "special situations": _COLOR_3,
+    "north america": _COLOR_1,
+    "europe": _COLOR_2,
+    "other": _COLOR_3,
+}
 
 _PCT_SUFFIX = re.compile(r"\s*\(\s*-?\d+(?:\.\d+)?\s*%\s*\)\s*$")
 
@@ -70,7 +83,16 @@ def _default_label(base: str, value: float) -> str:
 
 
 def _slice_color(label: str, index: int) -> str:
-    return _CAT_COLORS.get(label.lower().strip(), _DEFAULT_COLORS[index % len(_DEFAULT_COLORS)])
+    key = label.lower().strip()
+    # Direct hit (asset class or geography)
+    if key in _CAT_COLORS:
+        return _CAT_COLORS[key]
+    # Security type → inherit its asset class color
+    ac = _SEC_TO_AC.get(key)
+    if ac:
+        return _AC_COLOR.get(ac, _DEFAULT_COLORS[index % len(_DEFAULT_COLORS)])
+    # Fallback: sequential
+    return _DEFAULT_COLORS[index % len(_DEFAULT_COLORS)]
 
 
 def _make_dpt(idx: int, color: str) -> etree._Element:
