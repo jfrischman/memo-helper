@@ -1730,7 +1730,7 @@ HTML = r"""<!DOCTYPE html>
       if (!paths.length) { showError('Upload or add project files first.'); return; }
       const fundNames = (appState.result.fund_profiles || []).map(fp => fp.fund_name || fp.filename || '').filter(Boolean);
       parseProjFilesBtn.disabled = true; parseProjFilesBtn.textContent = 'Parsing…';
-      showParseSpinner(`Scanning folder and parsing project files for ${fundNames.length} fund(s)… (15–45 seconds)`);
+      showParseSpinner(`Scanning folder and parsing all fields for ${fundNames.length} fund(s)… (~30–60 seconds per fund)`);
       try {
         const r = await fetch('/api/fund_info/parse_project', {method:'POST',
           headers:{'Content-Type':'application/json'},

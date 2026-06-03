@@ -254,58 +254,101 @@ def expand_paths(paths: List[str], extensions: tuple = (".pdf",),
     return result
 
 
-def parse_project_files(paths: List[str], api_key: str,
-                        fund_names: List[str]) -> Dict[str, Dict]:
-    """Extract LP NAV, Unfunded, Commits for all funds from project-level overview files.
-    Accepts individual PDF paths or directory paths (scanned for PDFs up to 1 level deep)."""
-    # Expand any directory paths to individual PDFs
+def _build_context_from_paths(paths: List[str], max_chars: int = 80_000) -> tuple:
+    """Build combined text context from a list of PDF paths or a directory.
+    Returns (context_text, files_used_list)."""
     resolved = expand_paths(paths)
     if not resolved:
         raise ValueError(
             f"No PDF files found. Searched: {', '.join(paths)}.\n"
             "Upload PDF files directly or point to a folder containing PDFs.")
-
     all_ctx = ""
     files_used = []
     for p in resolved:
         try:
             pages = extract_pdf_pages(str(p))
-            rel = _filter_pages(pages, ["nav", "unfunded", "commitment", "net asset",
-                                         "capital account", "balance"], fallback_n=8)
-            chunk = _ctx(rel, 25_000)
+            rel = _filter_pages(pages, [
+                "nav", "unfunded", "commitment", "net asset", "capital account",
+                "net irr", "tvpi", "rvpi", "dpi", "performance", "return", "moic",
+                "balance sheet", "credit facility", "borrowing", "partners' capital",
+                "investment period", "term", "extension", "lpac",
+            ], fallback_n=15)
+            chunk = _ctx(rel, 20_000)
             if chunk.strip():
-                all_ctx += f"[File: {Path(p).name}]\n{chunk}\n\n"
+                all_ctx += f"\n\n[File: {Path(p).name}]\n{chunk}"
                 files_used.append(Path(p).name)
         except Exception:
             continue
     if not all_ctx:
         raise ValueError(
-            f"Found {len(resolved)} PDF(s) but could not extract text from any of them. "
-            "They may be scanned images — try uploading the specific overview PDF directly.")
-    all_ctx = all_ctx[:80_000]
+            f"Found {len(resolved)} PDF(s) but could not extract text. "
+            "They may be scanned images — try uploading the specific PDFs directly.")
+    return all_ctx[:max_chars], files_used
 
-    fund_list = ", ".join(fund_names)
-    r = _gpt(api_key, f"""From these deal overview documents, extract LP NAV, Unfunded Commitments, and Total Commitments for each of these funds: {fund_list}.
 
-{all_ctx}
+def parse_all_fields_for_fund(paths: List[str], api_key: str, fund_name: str) -> Dict:
+    """Extract ALL fund information fields from any collection of PDFs/folder.
+    One GPT call; asks for every column in the fund summary table."""
+    ctx, files_used = _build_context_from_paths(paths)
+    r = _gpt(api_key, f"""Analyze the documents below and extract all available information for the fund: {fund_name}.
 
-Return JSON where each top-level key is exactly one of the fund names listed above, and each value is an object with:
-- "lp_nav": LP NAV in millions as a number (null if not found)
-- "unfunded": unfunded commitments in millions as a number (null if not found)
-- "commits": total commitments in millions as a number (null if not found)
-- "source": brief quote showing where these figures appear
-- "as_of": date the figures are as of
-If a fund is not found in the documents, still include its key with all null values.""")
+{ctx}
 
-    result = {"_files_used": files_used}
+Return JSON with these exact keys (use null for any not found):
+- "lp_nav": LP/GCM stake NAV in millions as a number
+- "unfunded": unfunded commitments in millions as a number
+- "commits": total commitments in millions as a number
+- "irr": since-inception net IRR as "X.X%"
+- "tvpi": Total Value to Paid-In as "X.XXx"
+- "rvpi": Remaining Value to Paid-In as "X.XXx"
+- "dpi": Distributions to Paid-In as "X.XXx"
+- "leverage": interest-bearing liabilities / net assets as "X.X%" (exclude tax liabilities; "0.0%" if no borrowings)
+- "invest_end": investment period end date as "Mmm-YY" (e.g. "Feb-27")
+- "term_end": fund base termination date EXCLUDING extensions as "Mmm-YY"
+- "extensions": extension provisions as "N GP" or "N LPAC" or "N GP, N LPAC"
+- "perpetuity": true if further extensions beyond stated ones are possible, false otherwise
+- "perpetuity_note": brief description if perpetuity=true, else null
+- "as_of": date the performance / NAV data is as of
+- "sources": object mapping each key above to a brief note on where it was found (file name + quote)""")
+
+    note = r.get("as_of", "")
+    srcs = r.get("sources") or {}
+
+    def s(k):
+        base = srcs.get(k, "") if isinstance(srcs, dict) else str(srcs)
+        return " | ".join(filter(None, [base, note]))
+
+    result = {
+        "lp_nav":     _f(r.get("lp_nav"),     s("lp_nav")),
+        "unfunded":   _f(r.get("unfunded"),   s("unfunded")),
+        "commits":    _f(r.get("commits"),    s("commits")),
+        "irr":        _f(r.get("irr"),        s("irr")),
+        "tvpi":       _f(r.get("tvpi"),       s("tvpi")),
+        "rvpi":       _f(r.get("rvpi"),       s("rvpi")),
+        "dpi":        _f(r.get("dpi"),        s("dpi")),
+        "leverage":   _f(r.get("leverage"),   s("leverage")),
+        "invest_end": _f(r.get("invest_end"), s("invest_end")),
+        "term_end":   _f(r.get("term_end"),   s("term_end")),
+        "extensions": _f(r.get("extensions"), s("extensions"),
+                         perpetuity=bool(r.get("perpetuity", False)),
+                         perpetuity_note=r.get("perpetuity_note") or ""),
+        "_files_used": files_used,
+    }
+    return result
+
+
+def parse_project_files(paths: List[str], api_key: str,
+                        fund_names: List[str]) -> Dict[str, Dict]:
+    """Extract ALL fund information fields for every fund from a shared folder/file list.
+    Runs one GPT call per fund so fund-specific data (IRR, TVPI etc.) is correctly attributed."""
+    result = {}
+    all_files_used = set()
     for fname in fund_names:
-        fd = r.get(fname) or {}
-        src = " | ".join(filter(None, [fd.get("source", ""), fd.get("as_of", "")]))
-        result[fname] = {
-            "lp_nav":   _f(fd.get("lp_nav"),   src),
-            "unfunded": _f(fd.get("unfunded"), src),
-            "commits":  _f(fd.get("commits"),  src),
-        }
+        extracted = parse_all_fields_for_fund(paths, api_key, fname)
+        files_used = extracted.pop("_files_used", [])
+        all_files_used.update(files_used)
+        result[fname] = extracted
+    result["_files_used"] = list(all_files_used)
     return result
 
 
