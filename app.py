@@ -469,6 +469,10 @@ HTML = r"""<!DOCTYPE html>
           <label for="aliasesBox">Issuer aliases — force names to one issuer, <code>variant => issuer</code>. The same issuer named differently across funds is auto-combined; use this only for cases it can't catch (e.g. abbreviations).</label>
           <textarea id="aliasesBox" placeholder="Noble => Noble Supply and Logistics&#10;ABC Co; ABC Holdings => ABC"></textarea>
         </div>
+        <div class="field section-gap">
+          <label for="labelColorsBox">Pie label colors — one line per category, <code>Category = white</code> or <code>Category = black</code>. Auto-filled from results (≥7% = white, &lt;7% = black). Edit to override individual slices.</label>
+          <textarea id="labelColorsBox" placeholder="Corporate Lending = white&#10;ABS = black&#10;Special Situations = black&#10;North America = white&#10;Europe = black"></textarea>
+        </div>
       </div>
     </section>
 
@@ -607,6 +611,7 @@ HTML = r"""<!DOCTYPE html>
     const errorBox = document.getElementById('errorBox');
     const rulesBox = document.getElementById('rulesBox');
     const aliasesBox = document.getElementById('aliasesBox');
+    const labelColorsBox = document.getElementById('labelColorsBox');
     const resultsPane = document.getElementById('resultsPane');
     const downloadJsonBtn = document.getElementById('downloadJsonBtn');
     const downloadCsvBtn = document.getElementById('downloadCsvBtn');
@@ -655,6 +660,7 @@ HTML = r"""<!DOCTYPE html>
         memo_file_path: memoPathInput.value.trim(),
         rules: rulesBox.value || '',
         issuer_aliases: aliasesBox.value || '',
+        label_colors: labelColorsBox.value || '',
         funds,
       };
     }
@@ -698,6 +704,7 @@ HTML = r"""<!DOCTYPE html>
       memoPathInput.value = project.memo_file_path || '';
       rulesBox.value = project.rules || '';
       aliasesBox.value = project.issuer_aliases || '';
+      labelColorsBox.value = project.label_colors || '';
       setProjectStatus(project.project_id ? `Project saved: ${project.project_name || 'Untitled project'}` : 'No project loaded');
       populateProjectSelect(appState.projects, project.project_id);
     }
@@ -735,6 +742,7 @@ HTML = r"""<!DOCTYPE html>
         memoPathInput.value = '';
         rulesBox.value = '';
         aliasesBox.value = '';
+        labelColorsBox.value = '';
         fundList.innerHTML = '';
         resultsPane.innerHTML = '<div class="small-note">No exposure data yet. Add a fund and click calculate.</div>';
         setProjectStatus('No project loaded');
@@ -1380,6 +1388,7 @@ HTML = r"""<!DOCTYPE html>
         }
         appState.result = data;
         renderResults(data);
+        autoFillLabelColors(data);
       } catch (err) {
         showError(err.message || String(err));
       } finally {
@@ -1422,6 +1431,26 @@ HTML = r"""<!DOCTYPE html>
       const fundTableHtml = renderFundTable(data.funds);
 
       resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + concentrationTableHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
+    }
+
+    function autoFillLabelColors(data) {
+      // Only auto-fill if the box is empty — don't overwrite manual edits.
+      if (labelColorsBox.value.trim()) return;
+      const cats = data.categories || {};
+      const lines = [];
+      const THRESHOLD = 0.07;
+      ['asset_class', 'security_type', 'geography'].forEach((fam) => {
+        (cats[fam] || []).forEach((item) => {
+          const pct = Number(item.value || item.percentage || 0);
+          const color = pct >= THRESHOLD ? 'white' : 'black';
+          lines.push(`${item.label} = ${color}`);
+        });
+      });
+      // Deduplicate (same label may appear in multiple families)
+      const seen = new Set();
+      const unique = lines.filter((l) => { const k = l.split('=')[0].trim().toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+      labelColorsBox.value = unique.join('\n');
+      scheduleProjectSave();
     }
 
     function renderConcentrationTable(data) {
@@ -1696,6 +1725,12 @@ HTML = r"""<!DOCTYPE html>
       }
       scheduleChartRefresh();
     });
+    labelColorsBox.addEventListener('input', () => {
+      if (appState.project) {
+        setProjectStatus('Unsaved changes');
+        scheduleProjectSave();
+      }
+    });
 
     liveUpdateToggle.addEventListener('change', () => {
       if (liveUpdateToggle.checked) {
@@ -1894,6 +1929,8 @@ class Handler(BaseHTTPRequestHandler):
         project["rules"] = payload.get("rules") or ""
         if payload.get("issuer_aliases") is not None:
             project["issuer_aliases"] = payload.get("issuer_aliases") or ""
+        if payload.get("label_colors") is not None:
+            project["label_colors"] = payload.get("label_colors") or ""
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
@@ -1912,6 +1949,8 @@ class Handler(BaseHTTPRequestHandler):
         project["rules"] = payload.get("rules") or project.get("rules") or ""
         if payload.get("issuer_aliases") is not None:
             project["issuer_aliases"] = payload.get("issuer_aliases") or ""
+        if payload.get("label_colors") is not None:
+            project["label_colors"] = payload.get("label_colors") or ""
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         memo_path = project.get("memo_file_path") or ""
@@ -1924,7 +1963,7 @@ class Handler(BaseHTTPRequestHandler):
         saved = save_project(project)
         result = compute_project_exposure(payload_funds, UPLOADS, parse_mapping_rules(project.get("rules") or ""), issuer_aliases=project.get("issuer_aliases") or "")
         try:
-            update_sections_in_file(memo_path, result, sections=("exposures",))
+            update_sections_in_file(memo_path, result, sections=("exposures",), project=saved)
         except PermissionError:
             raise ValueError("Could not write the memo - is it open in Word? Close it and try again.")
         self._send_json(200, {"ok": True, "memo_file_path": memo_path, "project": saved})
@@ -1959,6 +1998,8 @@ class Handler(BaseHTTPRequestHandler):
         project["rules"] = payload.get("rules") or project.get("rules") or ""
         if payload.get("issuer_aliases") is not None:
             project["issuer_aliases"] = payload.get("issuer_aliases") or ""
+        if payload.get("label_colors") is not None:
+            project["label_colors"] = payload.get("label_colors") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)

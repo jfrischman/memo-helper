@@ -10,7 +10,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
-from native_charts import update_native_pies
+from native_charts import update_native_pies, parse_label_colors
 
 
 PROJECT_BALANCE_TEMPLATE = Path(
@@ -382,11 +382,13 @@ def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_pa
     _apply_exposure_tables(doc, result)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
-    update_native_pies(output_path, result.get("categories", {}) or {})
+    lc = parse_label_colors(project.get("label_colors") or "")
+    update_native_pies(output_path, result.get("categories", {}) or {}, label_colors=lc)
     return output_path
 
 
-def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposures",)) -> Path:
+def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposures",),
+                            project: Dict[str, Any] = None) -> Path:
     memo_path = Path(memo_path)
     if not memo_path.exists():
         raise FileNotFoundError(f"Memo file not found: {memo_path}")
@@ -401,5 +403,6 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
         refresh_pies = refresh_pies or also_pies
     doc.save(str(memo_path))
     if refresh_pies:
-        update_native_pies(memo_path, result.get("categories", {}) or {})
+        lc = parse_label_colors((project or {}).get("label_colors") or "")
+        update_native_pies(memo_path, result.get("categories", {}) or {}, label_colors=lc)
     return memo_path

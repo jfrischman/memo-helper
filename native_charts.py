@@ -146,31 +146,49 @@ def _make_label_txPr(color_hex: str) -> etree._Element:
     return txPr
 
 
-def _make_dLbl(idx: int) -> etree._Element:
-    """Per-slice dLbl with white text and explicit show-flags matching dLbls defaults.
-    The show-flags MUST be included — without them Word defaults to showing everything
-    (series name, cat name, value all concatenated), causing 'Series1...' labels."""
+def _make_dLbl(idx: int, color_hex: str = "FFFFFF") -> etree._Element:
+    """Per-slice dLbl with explicit color and show-flags matching dLbls defaults.
+    show-flags MUST be included — without them Word shows series name ('Series1...')."""
     C = C_NS
     dl = etree.Element(f"{{{C}}}dLbl")
     etree.SubElement(dl, f"{{{C}}}idx").set("val", str(idx))
-    # Explicit show flags — match the parent dLbls settings exactly
     etree.SubElement(dl, f"{{{C}}}showLegendKey").set("val", "0")
     etree.SubElement(dl, f"{{{C}}}showVal").set("val", "1")
     etree.SubElement(dl, f"{{{C}}}showCatName").set("val", "0")
     etree.SubElement(dl, f"{{{C}}}showSerName").set("val", "0")
     etree.SubElement(dl, f"{{{C}}}showPercent").set("val", "0")
     etree.SubElement(dl, f"{{{C}}}showBubbleSize").set("val", "0")
-    dl.append(_make_label_txPr("FFFFFF"))
+    dl.append(_make_label_txPr(color_hex))
     return dl
 
 
+def parse_label_colors(text: str) -> Dict[str, str]:
+    """Parse 'Category = white/black' lines into {canonical_label: hex}.
+    Case-insensitive. Returns {} if text is empty."""
+    out: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"\s*=\s*", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        label = parts[0].strip().lower()
+        color = parts[1].strip().lower()
+        if label:
+            out[label] = "000000" if color == "black" else "FFFFFF"
+    return out
+
+
 def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
-                      label_fmt: Callable[[str, float], str]) -> tuple[bytes, List[str]]:
+                      label_fmt: Callable[[str, float], str],
+                      label_colors: Dict[str, str] = None) -> tuple[bytes, List[str]]:
     """
     Rebuild the pie series to exactly match the non-zero blend categories.
     Adds new categories (e.g. ABS) and removes absent ones. Assigns colors by
     category name. A >0 value that rounds to 0% is kept and labeled '(0%)'.
     """
+    _label_colors_map = label_colors or {}
     keep = [(base_label(str(it.get("label", ""))),
              float(it.get("percentage") or it.get("value") or 0))
             for it in (items or [])
@@ -224,28 +242,23 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
         else:
             ser.append(dp)
 
-    # Update dLbls: disable leader lines, set default (outside) color to black,
-    # and add per-slice white overrides for slices >= INSIDE_THRESHOLD.
-    INSIDE_THRESHOLD = 0.08
+    # Update dLbls: disable leader lines, set default color to white, apply
+    # per-slice overrides from label_colors (injected via closure below).
     if dlbls is not None:
-        # Remove old per-slice overrides
         for dl in list(dlbls.findall("c:dLbl", NS)):
             dlbls.remove(dl)
-
-        # Disable leader lines
         for ll in list(dlbls.findall("c:showLeaderLines", NS)):
             dlbls.remove(ll)
         etree.SubElement(dlbls, f"{{{C_NS}}}showLeaderLines").set("val", "0")
-
-        # Default label color: black (for small outside slices)
+        # Default = white (unspecified categories stay white)
         for old_txPr in list(dlbls.findall("c:txPr", NS)):
             dlbls.remove(old_txPr)
-        dlbls.append(_make_label_txPr("000000"))
-
-        # Per-slice white override for large slices (rendered inside the pie)
-        for i, (base, share) in enumerate(keep):
-            if share >= INSIDE_THRESHOLD:
-                dlbls.insert(i, _make_dLbl(i))
+        dlbls.append(_make_label_txPr("FFFFFF"))
+        # Per-slice overrides from label_colors map
+        for i, (base, _) in enumerate(keep):
+            color = _label_colors_map.get(base.lower(), "FFFFFF")
+            if color != "FFFFFF":   # only need dLbl if overriding default (white)
+                dlbls.insert(i, _make_dLbl(i, color))
 
     notes = [f"{b}={v:.1%}" for b, v in keep]
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), notes
@@ -253,7 +266,8 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
 
 def update_native_pies(docx_path, blend_categories: Dict[str, Sequence[Dict[str, Any]]],
                        chart_map: Dict[str, str] = DEFAULT_CHART_MAP,
-                       label_fmt: Callable[[str, float], str] = _default_label) -> Dict[str, List[str]]:
+                       label_fmt: Callable[[str, float], str] = _default_label,
+                       label_colors: Dict[str, str] = None) -> Dict[str, List[str]]:
     docx_path = Path(docx_path)
     with zipfile.ZipFile(docx_path, "r") as zin:
         names = zin.namelist()
@@ -273,7 +287,7 @@ def update_native_pies(docx_path, blend_categories: Dict[str, Sequence[Dict[str,
         order_lower = {lbl.lower(): i for i, lbl in enumerate(order)}
         items = sorted(items, key=lambda it: order_lower.get(
             base_label(str(it.get("label", ""))).lower(), len(order)))
-        new_xml, notes = _update_chart_xml(contents[part], items, label_fmt)
+        new_xml, notes = _update_chart_xml(contents[part], items, label_fmt, label_colors)
         contents[part] = new_xml
         report[part] = notes
 
