@@ -217,6 +217,26 @@ def _table2_rows(result: Dict[str, Any]) -> List[List[str]]:
     return rows
 
 
+def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
+    """Update the Investment Summary box (table[0]) with live concentration stats."""
+    if not doc.tables:
+        return
+    t = doc.tables[0]
+    top = result.get("top_concentration") or {}
+    positions = result.get("top_positions") or []
+
+    def _set(row, col, text):
+        try:
+            _set_cell_text(t.rows[row].cells[col], text)
+        except (IndexError, Exception):
+            pass
+
+    _set(2, 3, _fmt_pct(top.get("top_1", 0)))   # R3 C4 – Top 1 Position
+    _set(3, 3, _fmt_pct(top.get("top_5", 0)))   # R4 C4 – Top 5 Position
+    gt20 = sum(1 for p in positions if p.get("value", 0) > 0.20)
+    _set(4, 3, str(gt20))                        # R5 C4 – Positions >20%
+
+
 def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:
     """Fill + format the two exposure-section tables (concentration, asset-type-by-fund)
     in an already-open document. Does not touch charts (handled separately)."""
@@ -239,6 +259,7 @@ def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:
     #  - asset-type-by-fund: Calibri 8; columns 3-6 centered + middle;
     #    column 2 (sub-asset class) widened + no-wrap to stay on one line.
     _format_table(doc.tables[3], center_from_col=2, wide_col=1)
+    _apply_summary_stats(doc, result)
 
 
 # Registry of updatable sections -> (table-updater on open doc, whether it also

@@ -474,7 +474,7 @@ HTML = r"""<!DOCTYPE html>
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Results</h2>
+        <h2>Exposure</h2>
         <div class="toolbar">
           <label class="btn secondary" style="display:inline-flex;align-items:center;gap:8px;">
             <input id="liveUpdateToggle" type="checkbox" checked />
@@ -487,7 +487,7 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="panel-body" id="resultsPane">
-        <div class="small-note">No results yet. Load workbooks and click calculate.</div>
+        <div class="small-note">No exposure data yet. Add a fund and click calculate.</div>
       </div>
     </section>
   </main>
@@ -736,7 +736,7 @@ HTML = r"""<!DOCTYPE html>
         rulesBox.value = '';
         aliasesBox.value = '';
         fundList.innerHTML = '';
-        resultsPane.innerHTML = '<div class="small-note">No results yet. Add a fund and click calculate.</div>';
+        resultsPane.innerHTML = '<div class="small-note">No exposure data yet. Add a fund and click calculate.</div>';
         setProjectStatus('No project loaded');
         populateProjectSelect(appState.projects, '');
         return;
@@ -1393,6 +1393,7 @@ HTML = r"""<!DOCTYPE html>
       const stats = [
         { k: 'Total bid', v: money(data.total_bid), s: `${data.funds.length} funds` },
         { k: 'Top 1 position', v: pct(data.top_concentration.top_1), s: 'project share' },
+        { k: 'Top 3 positions', v: pct(data.top_concentration.top_3), s: 'project share' },
         { k: 'Top 5 positions', v: pct(data.top_concentration.top_5), s: 'project share' },
         { k: 'Top 10 positions', v: pct(data.top_concentration.top_10), s: 'project share' },
       ];
@@ -1614,7 +1615,7 @@ HTML = r"""<!DOCTYPE html>
       appState.funds = [];
       appState.result = null;
       fundList.innerHTML = '';
-      resultsPane.innerHTML = '<div class="small-note">No results yet. Add a fund and click calculate.</div>';
+      resultsPane.innerHTML = '<div class="small-note">No exposure data yet. Add a fund and click calculate.</div>';
       showError('');
       scheduleProjectSave();
     });
