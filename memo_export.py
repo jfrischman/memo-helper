@@ -144,20 +144,43 @@ def _apply_summary_stats(doc: Document, result: Dict[str, Any]) -> None:
             if txt:
                 label_to_pos[txt] = (ri, ci)
 
-    # 1. Apply Calibri 9 + LEFT alignment to all cells first (dedup merged cells)
-    seen: set = set()
-    for row in t.rows:
-        for cell in row.cells:
-            if id(cell._tc) in seen:
-                continue
-            seen.add(id(cell._tc))
-            for p in cell.paragraphs:
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                for run in p.runs:
-                    run.font.name = "Calibri"
-                    run.font.size = Pt(9)
+    # Apply alignment and Calibri 9 directly via XML (bypasses table-style inheritance).
+    # Use row._tr.tc_lst to get actual cells with correct grid column positions.
+    # Rule: title rows (0-1) → all LEFT; data rows → even cols LEFT, odd cols CENTER.
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    from lxml import etree as _et
 
-    # 2. Update value cells with CENTER alignment (overrides the LEFT above)
+    def _force_align(p_el, jc_val):
+        pPr = p_el.find(f"{{{W}}}pPr")
+        if pPr is None:
+            pPr = _et.SubElement(p_el, f"{{{W}}}pPr")
+        for old in pPr.findall(f"{{{W}}}jc"):
+            pPr.remove(old)
+        jc = _et.SubElement(pPr, f"{{{W}}}jc")
+        jc.set(f"{{{W}}}val", jc_val)
+
+    for ri, row in enumerate(t.rows):
+        # Use tc index (not grid column) — avoids gridSpan miscounting.
+        # Table pattern: i=0,2,4 → labels (LEFT); i=1,3,5 → values (CENTER).
+        # Title rows (ri 0-1) and any merged title cell → always LEFT.
+        for i, tc in enumerate(row._tr.tc_lst):
+            jc_val = "left" if (ri <= 1 or i % 2 == 0) else "center"
+            for p_el in tc.findall(f"{{{W}}}p"):
+                _force_align(p_el, jc_val)
+                for r_el in p_el.findall(f".//{{{W}}}r"):
+                    rPr = r_el.find(f"{{{W}}}rPr")
+                    if rPr is None:
+                        rPr = _et.SubElement(r_el, f"{{{W}}}rPr")
+                    for tag in ("rFonts", "sz", "szCs"):
+                        for old in rPr.findall(f"{{{W}}}{tag}"):
+                            rPr.remove(old)
+                    rf = _et.SubElement(rPr, f"{{{W}}}rFonts")
+                    rf.set(f"{{{W}}}ascii", "Calibri")
+                    rf.set(f"{{{W}}}hAnsi", "Calibri")
+                    sz = _et.SubElement(rPr, f"{{{W}}}sz")
+                    sz.set(f"{{{W}}}val", "18")  # 9pt = 18 half-points
+
+    # Update specific value cells (these calls also write the new text + CENTER)
     def set_next(label: str, value: str):
         pos = label_to_pos.get(label)
         if pos is None:
