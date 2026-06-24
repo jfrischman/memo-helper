@@ -258,13 +258,15 @@ def read_cashflows(path: str) -> dict:
     if not case_cols or case_row is None:
         return {}
 
-    # For each case column, find S CFs col (= case col) and F CFs col (first col to right with "F CFs")
+    # For each case column, find the F CFs column (first col to the right whose label starts with "F")
+    # Note: "F CFs".upper() = "F CFS" which contains "S", so we cannot use "S" not in check —
+    # use startswith("F") to distinguish "F CFs" from "S CFs" reliably.
     def get_f_col(start_c: int) -> int:
         for offset in range(1, 6):
             v = cells.get((scf_row, start_c + offset))
-            if isinstance(v, str) and "F" in v.upper() and "S" not in v.upper():
+            if isinstance(v, str) and v.strip().upper().startswith("F"):
                 return start_c + offset
-        return start_c + 2  # fallback: Sec / Deferral / Fund → Fund is +2
+        return start_c + 2  # fallback
 
     base_s = case_cols.get("base", 3)
     bear_s = case_cols.get("bear", 6)
