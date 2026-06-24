@@ -944,7 +944,8 @@ def _render_cashflow_table_image(cf_data: dict) -> bytes:
             cell(COL_X[ci + 1], y, COL_W[ci + 1], rrow_h, bg, val, fs=5.5)
 
     buf = _io.BytesIO()
-    plt.savefig(buf, format="png", dpi=DPI)
+    # Embed a title so subsequent runs can re-identify this image via ASCII search
+    plt.savefig(buf, format="png", dpi=DPI, metadata={"Title": "Combined Cashflows"})
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -958,16 +959,20 @@ def _replace_cashflow_image(memo_path: Path, cf_data: dict) -> None:
     if not cf_data.get("rows"):
         return
 
-    needle = "Combined Cashflows".encode("utf-16-le")
+    # Search for the image using both encodings:
+    #   - UTF-16-LE: original EMF files embed text this way
+    #   - ASCII:     PNG files we render include "Combined Cashflows" in PNG metadata (Title tag)
+    needle_utf16 = "Combined Cashflows".encode("utf-16-le")
+    needle_ascii = b"Combined Cashflows"
 
     # Read all zip entries
     with zipfile.ZipFile(str(memo_path), "r") as zin:
         all_files = {n: zin.read(n) for n in zin.namelist()}
 
-    # Find the media file (any format) whose binary content contains the UTF-16 text
+    # Find the media file whose binary contains either marker
     emf_name: Optional[str] = None
     for name, data in all_files.items():
-        if name.startswith("word/media/") and needle in data:
+        if name.startswith("word/media/") and (needle_utf16 in data or needle_ascii in data):
             emf_name = name
             break
     if not emf_name:
