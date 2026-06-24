@@ -828,6 +828,246 @@ def _update_header_net_return(memo_path: Path, irr: float, moic: float) -> None:
             pass
 
 
+def _render_cashflow_table_image(cf_data: dict) -> bytes:
+    """Render the Combined Cashflows table as a PNG (3.67 inches wide)."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import io as _io
+    except ImportError:
+        raise RuntimeError("matplotlib is required. Run: pip install matplotlib")
+
+    header = cf_data.get("header", {})
+    cf_rows = cf_data.get("rows", [])
+
+    # Colors matching typical Excel IC memo table styling
+    C_BASE  = "#FFC000"
+    C_BEAR  = "#2F75B6"
+    C_MGR   = "#1F4E79"
+    C_DUR   = "#E2EFDA"
+    C_TITLE = "#404040"
+    C_ALT   = "#F2F2F2"
+    C_GRAY  = "#D9D9D9"
+
+    def _pct(v):  return f"{float(v)*100:.1f}%" if v is not None else ""
+    def _x(v):    return f"{float(v):.2f}x"     if v is not None else ""
+    def _yrs(v):  return f"{float(v):.2f} Yrs"  if v is not None else ""
+    def _cf(v):   return f"{float(v):.2f}"       if v is not None else ""
+
+    # Build the ordered rows (type, label, [6 values])
+    data_rows = [
+        ("irr",  "Net IRR",       [_pct(header.get(k)) for k in
+            ("base_irr_sec","base_irr_fund","bear_irr_sec","bear_irr_fund","mgr_irr_sec","mgr_irr_fund")]),
+        ("moic", "Net MOIC",      [_x(header.get(k))   for k in
+            ("base_moic_sec","base_moic_fund","bear_moic_sec","bear_moic_fund","mgr_moic_sec","mgr_moic_fund")]),
+        ("blank","",              ["", "", "", "", "", ""]),
+        ("dur",  "Duration (yrs)",[_yrs(header.get(k)) for k in
+            ("base_dur_sec","base_dur_fund","bear_dur_sec","bear_dur_fund","mgr_dur_sec","mgr_dur_fund")]),
+    ]
+    for row in cf_rows:
+        data_rows.append(("data", row["date"], [
+            _cf(row.get("base_s")), _cf(row.get("base_f")),
+            _cf(row.get("bear_s")), _cf(row.get("bear_f")),
+            _cf(row.get("mgr_s")),  _cf(row.get("mgr_f")),
+        ]))
+
+    # Row heights in inches
+    def rh(rtype):
+        return 0.065 if rtype == "blank" else 0.125
+
+    row_heights = [rh(rt) for rt, _, _ in data_rows]
+
+    # Figure dimensions (fixed 3.67" wide)
+    FIG_W   = 3.67
+    TITLE_H = 0.185
+    CASE_H  = 0.150
+    SCOL_H  = 0.135
+    fig_h = TITLE_H + CASE_H + SCOL_H + sum(row_heights)
+
+    # Column layout: date col + 6 value cols (2 per case)
+    COL_W = [0.79, 0.48, 0.48, 0.48, 0.48, 0.48, 0.48]
+    COL_X = [sum(COL_W[:i]) for i in range(7)]
+
+    DPI = 200
+    fig = plt.figure(figsize=(FIG_W, fig_h), dpi=DPI)
+    ax  = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, FIG_W)
+    ax.set_ylim(0, fig_h)
+    ax.set_aspect("auto")
+    ax.axis("off")
+
+    def cell(x, y, w, h, bg, txt="", fs=5.5, fg="black", bold=False, ha="center"):
+        ax.add_patch(mpatches.Rectangle(
+            (x, y), w, h, facecolor=bg, edgecolor="white",
+            linewidth=0.4, transform=ax.transData, clip_on=False))
+        if txt:
+            tx = x + w * 0.05 if ha == "left" else x + w / 2
+            ax.text(tx, y + h / 2, txt, fontsize=fs, ha=ha, va="center",
+                    color=fg, fontweight="bold" if bold else "normal",
+                    fontfamily="DejaVu Sans", transform=ax.transData, clip_on=True)
+
+    y = fig_h
+
+    # Title row
+    y -= TITLE_H
+    cell(0, y, FIG_W, TITLE_H, C_TITLE, "Combined Cashflows", fs=7, fg="white", bold=True)
+
+    # Case header row (spans 2 value cols per case)
+    y -= CASE_H
+    cell(0, y, COL_W[0], CASE_H, C_GRAY)
+    cell(COL_X[1], y, COL_W[1] + COL_W[2], CASE_H, C_BASE, "BASE CASE",    fs=6, fg="white", bold=True)
+    cell(COL_X[3], y, COL_W[3] + COL_W[4], CASE_H, C_BEAR, "BEAR CASE",    fs=6, fg="white", bold=True)
+    cell(COL_X[5], y, COL_W[5] + COL_W[6], CASE_H, C_MGR,  "MANAGER CASE", fs=6, fg="white", bold=True)
+
+    # S CFs / F CFs sub-headers
+    y -= SCOL_H
+    cell(0, y, COL_W[0], SCOL_H, C_GRAY)
+    for ci, (cc, lbl) in enumerate(zip(
+        [C_BASE, C_BASE, C_BEAR, C_BEAR, C_MGR, C_MGR],
+        ["S CFs", "F CFs", "S CFs", "F CFs", "S CFs", "F CFs"]
+    )):
+        cell(COL_X[ci + 1], y, COL_W[ci + 1], SCOL_H, cc, lbl, fs=5.5, fg="white", bold=True)
+
+    # Data rows
+    for ri, (rtype, label, vals) in enumerate(data_rows):
+        rrow_h = row_heights[ri]
+        y -= rrow_h
+        if rtype == "blank":
+            cell(0, y, FIG_W, rrow_h, "white")
+            continue
+        bg = C_DUR if rtype == "dur" else ("white" if ri % 2 == 0 else C_ALT)
+        bold_lbl = rtype in ("irr", "moic", "dur")
+        cell(0, y, COL_W[0], rrow_h, bg, label, fs=5.5, bold=bold_lbl, ha="left")
+        for ci, val in enumerate(vals):
+            cell(COL_X[ci + 1], y, COL_W[ci + 1], rrow_h, bg, val, fs=5.5)
+
+    buf = _io.BytesIO()
+    plt.savefig(buf, format="png", dpi=DPI)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _replace_cashflow_image(memo_path: Path, cf_data: dict) -> None:
+    """Find the Combined Cashflows EMF image in the docx and replace it with a freshly rendered PNG."""
+    import struct, re as _re, zipfile, shutil, tempfile
+    from lxml import etree as _et
+
+    if not cf_data.get("rows"):
+        return
+
+    needle = "Combined Cashflows".encode("utf-16-le")
+
+    # Read all zip entries
+    with zipfile.ZipFile(str(memo_path), "r") as zin:
+        all_files = {n: zin.read(n) for n in zin.namelist()}
+
+    # Find the media file (any format) whose binary content contains the UTF-16 text
+    emf_name: Optional[str] = None
+    for name, data in all_files.items():
+        if name.startswith("word/media/") and needle in data:
+            emf_name = name
+            break
+    if not emf_name:
+        raise ValueError("Could not find 'Combined Cashflows' image in the memo.")
+
+    # Find the relationship Id for this media file in document.xml.rels
+    rels_content = all_files.get("word/_rels/document.xml.rels", b"").decode("utf-8")
+    short_target = emf_name.replace("word/", "")   # e.g. "media/image2.emf"
+    filename_only = emf_name.split("/")[-1]          # e.g. "image2.emf"
+
+    rels_root = _et.fromstring(rels_content.encode("utf-8"))
+    rid: Optional[str] = None
+    for rel in rels_root:
+        t = rel.get("Target", "")
+        if t == short_target or t.endswith("/" + filename_only):
+            rid = rel.get("Id")
+            break
+    if not rid:
+        raise ValueError(f"Could not find relationship for {emf_name}")
+
+    # Render the new PNG
+    png_bytes = _render_cashflow_table_image(cf_data)
+
+    # Read PNG dimensions from IHDR (bytes 16-24: width, height as big-endian uint32)
+    w_px = struct.unpack(">I", png_bytes[16:20])[0]
+    h_px = struct.unpack(">I", png_bytes[20:24])[0]
+    DPI = 200
+    new_cx = int((w_px / DPI) * 914400)
+    new_cy = int((h_px / DPI) * 914400)
+
+    # Assign a new filename for the PNG (avoid reusing the old .emf name)
+    existing_nums = [int(m.group(1)) for n in all_files
+                     for m in [_re.search(r"word/media/image(\d+)\.", n)] if m]
+    new_num  = max(existing_nums) + 1 if existing_nums else 1
+    new_png_name   = f"word/media/image{new_num}.png"
+    new_png_short  = f"media/image{new_num}.png"
+
+    # Update document.xml — find the anchor that embeds this rId and update extent values
+    doc_xml = all_files.get("word/document.xml", b"")
+    doc_root = _et.fromstring(doc_xml)
+    WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    A  = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    R  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+    updated_anchor = False
+    for anchor in doc_root.iter(f"{{{WP}}}anchor"):
+        blips = anchor.findall(f".//{{{A}}}blip")
+        if not any(b.get(f"{{{R}}}embed") == rid for b in blips):
+            continue
+        # Update blip embed to point to new rId (same rId, target changes in rels)
+        # Update <wp:extent cx cy>
+        extent = anchor.find(f"{{{WP}}}extent")
+        if extent is not None:
+            extent.set("cx", str(new_cx))
+            extent.set("cy", str(new_cy))
+        # Update <a:ext cx cy> inside <a:xfrm>
+        for ext in anchor.findall(f".//{{{A}}}ext"):
+            parent = ext.getparent()
+            if parent is not None and parent.tag == f"{{{A}}}xfrm":
+                ext.set("cx", str(new_cx))
+                ext.set("cy", str(new_cy))
+        updated_anchor = True
+        break
+
+    new_doc_xml = _et.tostring(doc_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    # Update the relationships file: retarget rid to new PNG
+    new_rels = rels_content.replace(
+        f'Target="{short_target}"',
+        f'Target="{new_png_short}"',
+    )
+
+    # Ensure PNG content type is registered in [Content_Types].xml
+    ct_xml = all_files.get("[Content_Types].xml", b"").decode("utf-8")
+    if 'Extension="png"' not in ct_xml and "extension=\"png\"" not in ct_xml.lower():
+        ct_xml = ct_xml.replace(
+            "</Types>",
+            '<Default Extension="png" ContentType="image/png"/></Types>',
+        )
+
+    # Rebuild the zip (drop old EMF, add new PNG, updated rels + doc + content types)
+    new_files = {}
+    for name, data in all_files.items():
+        if name == emf_name:
+            continue  # drop old image
+        elif name == "word/_rels/document.xml.rels":
+            new_files[name] = new_rels.encode("utf-8")
+        elif name == "word/document.xml" and updated_anchor:
+            new_files[name] = new_doc_xml
+        elif name == "[Content_Types].xml":
+            new_files[name] = ct_xml.encode("utf-8")
+        else:
+            new_files[name] = data
+    new_files[new_png_name] = png_bytes
+
+    with zipfile.ZipFile(str(memo_path), "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in new_files.items():
+            zout.writestr(name, data)
+
+
 def _apply_model_outputs(doc: Document, result: Dict[str, Any]) -> None:
     """Update Investment Summary table (table[0]) with model outputs."""
     model = result.get("_model_outputs")
@@ -923,11 +1163,14 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
     if refresh_pies:
         lc = parse_label_colors((project or {}).get("label_colors") or "")
         update_native_pies(memo_path, result.get("categories", {}) or {}, label_colors=lc)
-    # Update header net return after saving (requires ZIP access)
+    # Post-save ZIP-based updates for model outputs
     if "model_outputs" in sections:
         model = result.get("_model_outputs") or {}
         base_irr = model.get("base_irr")
         base_moic = model.get("base_moic")
         if base_irr is not None and base_moic is not None:
             _update_header_net_return(memo_path, base_irr, base_moic)
+        cf_data = result.get("_cashflows")
+        if cf_data and cf_data.get("rows"):
+            _replace_cashflow_image(memo_path, cf_data)
     return memo_path

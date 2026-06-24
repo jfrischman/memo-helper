@@ -2965,9 +2965,14 @@ class Handler(BaseHTTPRequestHandler):
         saved = save_project(project)
         try:
             model_outputs = model_reader.read_model_outputs(xlsx_path)
+            cashflows = {}
+            try:
+                cashflows = model_reader.read_cashflows(xlsx_path)
+            except Exception:
+                pass  # cashflow image update is non-fatal
             update_sections_in_file(
                 memo_path,
-                {"_model_outputs": model_outputs},
+                {"_model_outputs": model_outputs, "_cashflows": cashflows},
                 sections=("model_outputs",),
                 project=saved,
             )
