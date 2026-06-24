@@ -49,13 +49,6 @@ DEFAULT_FIELD_SYNONYMS: Dict[str, List[str]] = {
         "location",
         "geo",
     ],
-    "sub_asset_class": [
-        "sub asset class",
-        "sub-asset class",
-        "subasset class",
-        "strategy",
-        "strategy bucket",
-    ],
 }
 
 
@@ -221,7 +214,7 @@ def parse_manual_family_text(text: str) -> Dict[str, List[Tuple[str, float]]]:
         if not line or line.startswith("#"):
             continue
         match = re.match(
-            r"^(geography|asset\s*class|asset_class|security\s*type|security_type|sub\s*asset\s*class|sub_asset_class)\s*[:=]\s*(.+)$",
+            r"^(geography|asset\s*class|asset_class|security\s*type|security_type)\s*[:=]\s*(.+)$",
             line,
             flags=re.IGNORECASE,
         )
@@ -253,7 +246,6 @@ def normalize_family_name(name: Any) -> str:
         "asset_classes": "asset_class",
         "security": "security_type",
         "security_types": "security_type",
-        "subassetclass": "sub_asset_class",
     }
     return aliases.get(family, family)
 
@@ -504,9 +496,6 @@ def detect_default_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     if "record_date_nav" not in mapping or not mapping.get("record_date_nav"):
         mapping["record_date_nav"] = _find_best_numeric_column(df)
 
-    if mapping.get("sub_asset_class") is None and mapping.get("security_type"):
-        mapping["sub_asset_class"] = mapping["security_type"]
-
     return mapping
 
 
@@ -565,7 +554,7 @@ def _position_label(row: pd.Series, name_col: Optional[str]) -> str:
         if text:
             return text
     fallback_bits: List[str] = []
-    for key in ["asset_class", "security_type", "geography", "sub_asset_class"]:
+    for key in ["asset_class", "security_type", "geography"]:
         val = row.get(key)
         if pd.notna(val) and str(val).strip():
             fallback_bits.append(str(val).strip())
@@ -684,13 +673,11 @@ def _compute_fund_profile(
     pos.sort(key=lambda d: -d["value"])
     out["position_exposure"] = pos
 
-    for family in ["asset_class", "security_type", "geography", "sub_asset_class"]:
+    for family in ["asset_class", "security_type", "geography"]:
         if family in manual_families:
             out["categories"][family] = _build_manual_category_breakdown(manual_families[family])
             continue
         family_col_name = column_map.get(family)
-        if family == "sub_asset_class" and not family_col_name:
-            family_col_name = column_map.get("security_type")
         family_col = _resolve_column(invested, family_col_name)
         breakdown = _build_category_breakdown(invested, "_nav", family_col, normalization_rules)
         if breakdown:
@@ -703,11 +690,9 @@ def _manual_fund_profile(manual_families: Dict[str, List[Tuple[str, float]]]) ->
     """Profile for a fund with no workbook: categories come straight from the manual
     overrides (asset class / security type / geography). No positions or NAV."""
     out: Dict[str, Any] = {"total_nav": 0.0, "positions": 0, "position_exposure": [], "categories": {}, "cash_rows": 0}
-    for family in ["asset_class", "security_type", "geography", "sub_asset_class"]:
+    for family in ["asset_class", "security_type", "geography"]:
         if family in manual_families:
             out["categories"][family] = _build_manual_category_breakdown(manual_families[family])
-    if "sub_asset_class" not in out["categories"] and "security_type" in out["categories"]:
-        out["categories"]["sub_asset_class"] = list(out["categories"]["security_type"])
     return out
 
 
@@ -751,9 +736,6 @@ def compute_project_exposure(
     for fund, has_wb, manual_families, bid in prepared:
         weight = bid / total_bid
         column_map = fund.get("column_map") or {}
-        if not column_map.get("sub_asset_class") and column_map.get("security_type"):
-            column_map["sub_asset_class"] = column_map.get("security_type")
-
         if has_wb:
             upload = uploads[fund["upload_id"]]
             sheet_name = fund.get("sheet_name") or upload["default_sheet"]

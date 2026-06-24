@@ -30,6 +30,7 @@ def default_fund_info() -> Dict:
         "scale_pct": 100.0,
         "quarterly_letter_path": None,
         "afs_path": None,
+        "cas_path": None,
         "lpa_path": None,
         "fields": {
             "lp_nav":     _f(),
@@ -136,23 +137,133 @@ def _gpt(api_key: str, prompt: str, model: str = "gpt-4o") -> Dict:
     return json.loads(r.choices[0].message.content)
 
 
+def _gpt_vision(api_key: str, images_b64: List[str], prompt: str,
+                model: str = "gpt-4o") -> Dict:
+    """Send page images to GPT-4o vision and return parsed JSON."""
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    content: list = [{"type": "text", "text": prompt}]
+    for b64 in images_b64:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+        })
+    r = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _SYS},
+            {"role": "user",   "content": content},
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(r.choices[0].message.content)
+
+
+def _pdf_to_images_b64(path: str, page_indices: List[int],
+                       scale: float = 1.5) -> List[str]:
+    """Render specific PDF pages to base64 PNG strings using pymupdf."""
+    import base64
+    import fitz
+    result = []
+    with fitz.open(str(path)) as doc:
+        matrix = fitz.Matrix(scale, scale)
+        for i in page_indices:
+            if 0 <= i < len(doc):
+                try:
+                    pix = doc[i].get_pixmap(matrix=matrix, alpha=False)
+                    result.append(base64.b64encode(pix.tobytes("png")).decode())
+                except Exception:
+                    pass
+    return result
+
+
+def _select_vision_pages(path: str, max_pages: int = 20) -> List[int]:
+    """Pick the most data-rich pages for vision parsing."""
+    import fitz
+    kw = ["irr", "tvpi", "dpi", "rvpi", "moic", "net irr", "invested", "committed",
+          "track record", "investment period", "fund summary", "recap", "snapshot",
+          "distribution", "nav", "unfunded", "term", "extension"]
+    with fitz.open(str(path)) as doc:
+        n = len(doc)
+        scored: List[Tuple[int, int]] = []
+        for i in range(n):
+            try:
+                text = doc[i].get_text().lower()
+            except Exception:
+                text = ""
+            score = sum(text.count(k) for k in kw)
+            scored.append((i, score))
+
+    priority = list(range(min(2, n)))
+    rest = sorted(
+        [(i, sc) for i, sc in scored if i not in priority],
+        key=lambda x: -x[1]
+    )
+    pages = priority + [i for i, _ in rest[: max_pages - len(priority)]]
+    return sorted(set(pages))[:max_pages]
+
+
+def parse_with_vision(path: str, api_key: str, fund_name: str = "",
+                      include_nav: bool = True) -> Dict:
+    """Parse a fund PDF using GPT-4o vision.
+
+    include_nav=False: skip lp_nav/unfunded/commits (for quarterly letters).
+    """
+    pages = _select_vision_pages(path, max_pages=20)
+    images = _pdf_to_images_b64(path, pages, scale=1.5)
+    if not images:
+        raise ValueError("Could not render any pages from the PDF.")
+    prompt_template = _COMPREHENSIVE_PROMPT if include_nav else _PERFORMANCE_PROMPT
+    prompt = prompt_template.format(
+        fund=fund_name or "the fund",
+        ctx="[See attached page images — extract data from the tables and text visible in the images]",
+    )
+    r = _gpt_vision(api_key, images, prompt)
+    note = r.get("as_of", "")
+    srcs = r.get("sources") or {}
+
+    def s(k):
+        base = srcs.get(k, "") if isinstance(srcs, dict) else ""
+        return " | ".join(filter(None, [base, note]))
+
+    result = {
+        "irr":        _f(r.get("irr"),        s("irr")),
+        "tvpi":       _f(r.get("tvpi"),       s("tvpi")),
+        "rvpi":       _f(r.get("rvpi"),       s("rvpi")),
+        "dpi":        _f(r.get("dpi"),        s("dpi")),
+        "leverage":   _f(r.get("leverage"),   s("leverage")),
+        "invest_end": _f(r.get("invest_end"), s("invest_end")),
+        "term_end":   _f(r.get("term_end"),   s("term_end")),
+        "extensions": _f(r.get("extensions"), s("extensions"),
+                         perpetuity=bool(r.get("perpetuity", False)),
+                         perpetuity_note=r.get("perpetuity_note") or ""),
+    }
+    if include_nav:
+        result["lp_nav"]   = _f(r.get("lp_nav"),   s("lp_nav"))
+        result["unfunded"] = _f(r.get("unfunded"), s("unfunded"))
+        result["commits"]  = _f(r.get("commits"),  s("commits"))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Extraction functions
 # ---------------------------------------------------------------------------
 
+# Used for project-files parsing (deal overview, capital account statements)
 _COMPREHENSIVE_PROMPT = """Extract all available fund information for {fund} from this document.
 
 {ctx}
 
 Return JSON with these exact keys (null for any not found in this document):
-- "irr": since-inception net IRR as "X.X%" (e.g. "15.0%")
-- "tvpi": Total Value to Paid-In as "X.XXx" (e.g. "1.20x")
-- "rvpi": Remaining Value to Paid-In as "X.XXx"
-- "dpi": Distributions to Paid-In as "X.XXx"
-- "leverage": interest-bearing liabilities / net assets as "X.X%" (exclude tax liabilities; "0.0%" if no borrowings)
-- "lp_nav": LP/GCM stake NAV in millions as a number
-- "unfunded": unfunded commitments in millions as a number
-- "commits": total commitments in millions as a number
+- "irr": since-inception net IRR as "X.X%" — look for "Net IRR", "Net Return", or equivalent
+- "tvpi": Total Value to Paid-In (TVPI) as "X.XXx" — SAME as MOIC (Multiple on Invested Capital); look for "TVPI", "MOIC", "Total Multiple", "Cash-on-Cash"
+- "rvpi": Remaining Value to Paid-In (RVPI) as "X.XXx" — NAV divided by paid-in capital
+- "dpi": Distributed to Paid-In (DPI) as "X.XXx" — cumulative distributions divided by paid-in capital (e.g. 0.776x if 77.6%)
+- "leverage": fund-level debt-to-equity ratio as "X.X%" — interest-bearing debt / net assets; exclude tax liabilities; "0.0%" if no borrowings
+- "lp_nav": GCM's LP stake NAV in millions as a number — this is GCM's specific share of NAV from a capital account or deal summary, NOT total fund NAV
+- "unfunded": GCM's remaining unfunded commitment in millions as a number
+- "commits": GCM's total commitment to the fund in millions as a number
 - "invest_end": investment period end date as "Mmm-YY" (e.g. "Feb-27")
 - "term_end": fund base termination date EXCLUDING extensions as "Mmm-YY"
 - "extensions": extension provisions as "N GP" or "N LPAC" or "N GP, N LPAC"
@@ -161,11 +272,37 @@ Return JSON with these exact keys (null for any not found in this document):
 - "as_of": date the performance / NAV data is as of
 - "sources": object mapping each populated key to a brief note (file section + quote)"""
 
+# Used for quarterly letters and AFS — performance metrics only, NO NAV/commitment fields
+_PERFORMANCE_PROMPT = """Extract performance and lifecycle data for {fund} from this document.
 
-def _comprehensive_extract(ctx: str, api_key: str, fund_name: str) -> Dict:
-    """Run the comprehensive extraction prompt and return structured field dict."""
-    r = _gpt(api_key, _COMPREHENSIVE_PROMPT.format(
-        fund=fund_name or "the fund", ctx=ctx))
+{ctx}
+
+Return JSON with these exact keys (null for any not found):
+- "irr": since-inception net IRR as "X.X%" — look for "Net IRR", "Net Return", or equivalent
+- "tvpi": Total Value to Paid-In (TVPI) as "X.XXx" — SAME as MOIC (Multiple on Invested Capital); look for "TVPI", "MOIC", "Total Multiple", "Cash-on-Cash", "Gross MOIC", "Net MOIC"
+- "rvpi": Remaining Value to Paid-In (RVPI) as "X.XXx" — NAV / paid-in capital
+- "dpi": Distributed to Paid-In (DPI) as "X.XXx" — cumulative distributions / paid-in capital (e.g. 0.776x for 77.6% DPI)
+- "leverage": fund-level debt-to-equity ratio as "X.X%" — interest-bearing debt / net assets; "0.0%" if no borrowings
+- "invest_end": investment period end date as "Mmm-YY"
+- "term_end": fund base termination date EXCLUDING extensions as "Mmm-YY"
+- "extensions": extension provisions as "N GP" or "N LPAC" or "N GP, N LPAC"
+- "perpetuity": true if further extensions beyond stated ones are possible, false otherwise
+- "perpetuity_note": one-sentence description if perpetuity=true, else null
+- "as_of": date the performance data is as of
+- "sources": object mapping each populated key to a brief note (file section + quote)
+
+DO NOT extract lp_nav, unfunded, or commits — those come from capital account statements only.
+The document may show total fund NAV or total committed capital; ignore those."""
+
+
+def _extract(prompt_template: str, ctx: str, api_key: str, fund_name: str,
+             include_nav: bool = True) -> Dict:
+    """Run an extraction prompt and return a structured field dict.
+
+    include_nav=False omits lp_nav/unfunded/commits from the result so that
+    quarterly-letter parses never overwrite deal-overview NAV data.
+    """
+    r = _gpt(api_key, prompt_template.format(fund=fund_name or "the fund", ctx=ctx))
     note = r.get("as_of", "")
     srcs = r.get("sources") or {}
 
@@ -173,40 +310,113 @@ def _comprehensive_extract(ctx: str, api_key: str, fund_name: str) -> Dict:
         base = srcs.get(k, "") if isinstance(srcs, dict) else ""
         return " | ".join(filter(None, [base, note]))
 
-    return {
+    result = {
         "irr":        _f(r.get("irr"),        s("irr")),
         "tvpi":       _f(r.get("tvpi"),       s("tvpi")),
         "rvpi":       _f(r.get("rvpi"),       s("rvpi")),
         "dpi":        _f(r.get("dpi"),        s("dpi")),
         "leverage":   _f(r.get("leverage"),   s("leverage")),
-        "lp_nav":     _f(r.get("lp_nav"),     s("lp_nav")),
-        "unfunded":   _f(r.get("unfunded"),   s("unfunded")),
-        "commits":    _f(r.get("commits"),    s("commits")),
         "invest_end": _f(r.get("invest_end"), s("invest_end")),
         "term_end":   _f(r.get("term_end"),   s("term_end")),
         "extensions": _f(r.get("extensions"), s("extensions"),
                          perpetuity=bool(r.get("perpetuity", False)),
                          perpetuity_note=r.get("perpetuity_note") or ""),
     }
+    if include_nav:
+        result["lp_nav"]   = _f(r.get("lp_nav"),   s("lp_nav"))
+        result["unfunded"] = _f(r.get("unfunded"), s("unfunded"))
+        result["commits"]  = _f(r.get("commits"),  s("commits"))
+    return result
+
+
+def _comprehensive_extract(ctx: str, api_key: str, fund_name: str) -> Dict:
+    return _extract(_COMPREHENSIVE_PROMPT, ctx, api_key, fund_name, include_nav=True)
 
 
 def parse_quarterly_letter(path: str, api_key: str, fund_name: str = "") -> Dict:
-    """Extract all available fund info from a quarterly letter."""
+    """Extract performance metrics from a quarterly/semi-annual letter.
+
+    Uses vision API when pymupdf is available. Never overwrites lp_nav,
+    unfunded, or commits — those come from deal-overview docs only.
+    """
+    try:
+        import fitz  # noqa: F401
+        return parse_with_vision(path, api_key, fund_name, include_nav=False)
+    except ImportError:
+        pass
     pages = extract_pdf_pages(path)
     rel = _filter_pages(pages, ["net irr", "tvpi", "rvpi", "dpi", "performance",
-                                 "return", "moic", "nav", "commitment", "investment period",
-                                 "term", "extension"])
-    return _comprehensive_extract(_ctx(rel), api_key, fund_name)
+                                 "return", "moic", "investment period", "term", "extension"])
+    return _extract(_PERFORMANCE_PROMPT, _ctx(rel), api_key, fund_name, include_nav=False)
 
 
 def parse_afs(path: str, api_key: str, fund_name: str = "") -> Dict:
-    """Extract all available fund info from Audited Financial Statements."""
+    """Extract performance and leverage data from Audited Financial Statements.
+
+    Uses vision API when pymupdf is available. Never overwrites lp_nav,
+    unfunded, or commits — those come from deal-overview docs only.
+    """
+    try:
+        import fitz  # noqa: F401
+        return parse_with_vision(path, api_key, fund_name, include_nav=False)
+    except ImportError:
+        pass
     pages = extract_pdf_pages(path)
-    rel = _filter_pages(pages, ["balance sheet", "statement of assets", "net assets",
-                                 "credit facility", "revolving credit", "borrowings",
-                                 "partners' capital", "irr", "tvpi", "performance",
-                                 "investment period", "term", "extension"])
-    return _comprehensive_extract(_ctx(rel), api_key, fund_name)
+    rel = _filter_pages(pages, ["balance sheet", "net assets", "credit facility",
+                                 "borrowings", "partners' capital", "irr", "tvpi",
+                                 "moic", "performance", "investment period", "term", "extension"])
+    return _extract(_PERFORMANCE_PROMPT, _ctx(rel), api_key, fund_name, include_nav=False)
+
+
+_CAS_PROMPT = """Extract GCM's capital account data for {fund} from this Capital Account Statement.
+
+{ctx}
+
+Return JSON with these exact keys (null for any not found):
+- "lp_nav": GCM's LP ending capital balance in millions as a number — look for "Ending Balance", "Ending Capital Balance", "Net Asset Value", "Partners' Capital", "Ending Capital Account Balance"
+- "unfunded": GCM's remaining unfunded commitment in millions as a number — look for "Unfunded Commitment", "Remaining Commitment", "Undrawn Commitment"
+- "commits": GCM's total commitment to the fund in millions as a number — look for "Total Commitment", "Capital Commitment", "Committed Capital"
+- "as_of": the statement period end date as "Mmm-YY"
+- "sources": object mapping each populated key to a brief note (section + quoted label)
+
+Focus on GCM's specific LP account balance, not total fund NAV. Values should be in millions (e.g. 12.5 for $12.5m)."""
+
+
+def parse_cas(path: str, api_key: str, fund_name: str = "") -> Dict:
+    """Extract NAV (ending capital balance), unfunded, and total commitment from a CAS.
+    Uses vision API when pymupdf is available since CAS docs are often scanned images."""
+    def _build_result(r: Dict) -> Dict:
+        note = r.get("as_of", "")
+        srcs = r.get("sources") or {}
+        def s(k):
+            base = srcs.get(k, "") if isinstance(srcs, dict) else ""
+            return " | ".join(filter(None, [base, note]))
+        return {
+            "lp_nav":   _f(r.get("lp_nav"),   s("lp_nav")),
+            "unfunded": _f(r.get("unfunded"), s("unfunded")),
+            "commits":  _f(r.get("commits"),  s("commits")),
+        }
+
+    try:
+        import fitz  # noqa: F401
+        pages = _select_vision_pages(path, max_pages=10)
+        images = _pdf_to_images_b64(path, pages, scale=1.5)
+        if images:
+            r = _gpt_vision(api_key, images, _CAS_PROMPT.format(
+                fund=fund_name or "the fund",
+                ctx="[See attached page images — extract data visible in tables and text]",
+            ))
+            return _build_result(r)
+    except ImportError:
+        pass
+
+    pages = extract_pdf_pages(path)
+    rel = _filter_pages(pages, [
+        "ending balance", "ending capital", "net asset value", "partners' capital",
+        "unfunded", "commitment", "capital account", "nav",
+    ], fallback_n=10)
+    r = _gpt(api_key, _CAS_PROMPT.format(fund=fund_name or "the fund", ctx=_ctx(rel, 30_000)))
+    return _build_result(r)
 
 
 _MONTH = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
@@ -270,27 +480,18 @@ def parse_lpa(path: str, api_key: str, fund_name: str = "") -> Dict:
 def expand_paths(paths: List[str], extensions: tuple = (".pdf",),
                  max_files: int = 20) -> List[str]:
     """Expand any directory paths to individual files matching extensions.
-    Scans the directory itself and one level of subdirectories."""
+    Searches recursively through all subdirectories."""
     result = []
     for p in paths:
         path = Path(p)
         if path.is_file() and path.suffix.lower() in extensions:
             result.append(str(path))
         elif path.is_dir():
-            # Top-level files
-            for f in sorted(path.iterdir()):
-                if f.is_file() and f.suffix.lower() in extensions:
+            for f in sorted(path.rglob("*")):
+                if not f.is_dir() and f.suffix.lower() in extensions:
                     result.append(str(f))
                     if len(result) >= max_files:
                         return result
-            # One level of subdirectories
-            for sub in sorted(path.iterdir()):
-                if sub.is_dir():
-                    for f in sorted(sub.iterdir()):
-                        if f.is_file() and f.suffix.lower() in extensions:
-                            result.append(str(f))
-                            if len(result) >= max_files:
-                                return result
     return result
 
 

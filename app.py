@@ -381,6 +381,21 @@ HTML = r"""<!DOCTYPE html>
       border-color: var(--accent);
       background: rgba(31,95,116,.05);
     }
+    .drop-zone.drag-over * {
+      pointer-events: none;
+    }
+    .fi-lock-btn {
+      background: none; border: none; cursor: pointer;
+      font-size: 13px; padding: 0 2px; line-height: 1;
+      opacity: 0.25; transition: opacity .15s;
+      flex-shrink: 0;
+    }
+    .fi-lock-btn:hover { opacity: 0.7; }
+    .fi-lock-btn.locked { opacity: 1; color: var(--accent); }
+    .fi-cell.locked {
+      border-color: var(--accent) !important;
+      background: rgba(31,95,116,.06);
+    }
     .pill {
       display:inline-block;
       padding: 2px 8px;
@@ -413,6 +428,7 @@ HTML = r"""<!DOCTYPE html>
           <button class="btn" id="saveProjectBtn">Save project</button>
           <button class="btn primary" id="updateExposuresBtn">Update Exposures</button>
           <button class="btn primary" id="updateFundInfoBtn" style="background:var(--accent-2)">Update Fund Information</button>
+          <button class="btn primary" id="updateModelOutputsBtn" style="background:#6b5b95">Update Model Outputs</button>
           <button class="btn" id="updateAllBtn">Update All</button>
           <button class="btn" id="exportMemoBtn">Export memo</button>
         </div>
@@ -438,6 +454,13 @@ HTML = r"""<!DOCTYPE html>
             <div style="display:flex; gap:8px;">
               <input type="text" id="memoPathInput" placeholder="C:\Users\...\OneDrive - GCM Grosvenor\...\Project X IC Memo.docx" style="flex:1;" />
               <button class="btn" id="browseMemoBtn" type="button">Browse…</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="modelXlsxPathInput">Excel model file</label>
+            <div style="display:flex; gap:8px;">
+              <input type="text" id="modelXlsxPathInput" placeholder="C:\Users\...\Project X - Combined Model.xlsx" style="flex:1;" />
+              <button class="btn" id="browseModelBtn" type="button">Browse…</button>
             </div>
           </div>
           <div class="field">
@@ -499,6 +522,7 @@ HTML = r"""<!DOCTYPE html>
           <span id="fundInfoParseMsg" style="font-size:13px;color:var(--muted)">Parsing…</span>
         </div>
         <style>@keyframes fi-spin{to{transform:rotate(360deg)}}</style>
+        <div id="fundInfoErrorBox" class="error section-gap" style="display:none;"></div>
         <div class="section-gap" id="fundInfoTableWrap">
           <div class="small-note">Add funds and parse documents to populate the fund information table.</div>
         </div>
@@ -606,7 +630,6 @@ HTML = r"""<!DOCTYPE html>
       asset_class: 'Asset class',
       security_type: 'Security type',
       geography: 'Geography',
-      sub_asset_class: 'Sub-asset class',
     };
     const GEOGRAPHY_OPTIONS = ['North America', 'Europe', 'Other'];
     const ASSET_CLASS_OPTIONS = ['Corporate Lending', 'ABS', 'Special Situations'];
@@ -659,7 +682,10 @@ HTML = r"""<!DOCTYPE html>
     const memoNameInput = document.getElementById('memoNameInput');
     const memoPathInput = document.getElementById('memoPathInput');
     const browseMemoBtn = document.getElementById('browseMemoBtn');
+    const modelXlsxPathInput = document.getElementById('modelXlsxPathInput');
+    const browseModelBtn = document.getElementById('browseModelBtn');
     const updateExposuresBtn = document.getElementById('updateExposuresBtn');
+    const updateModelOutputsBtn = document.getElementById('updateModelOutputsBtn');
     const updateFundInfoBtn = document.getElementById('updateFundInfoBtn');
     const updateAllBtn = document.getElementById('updateAllBtn');
     const openaiKeyInput = document.getElementById('openaiKeyInput');
@@ -672,13 +698,35 @@ HTML = r"""<!DOCTYPE html>
     const fundInfoParseStatus = document.getElementById('fundInfoParseStatus');
     const fundInfoParseMsg = document.getElementById('fundInfoParseMsg');
 
+    // Merge parsed fields into a fund_info object, never overwriting existing
+    // non-null values with null, and never touching the override.
+    function mergeFields(fi, newFields) {
+      if (!fi.fields) fi.fields = {};
+      Object.entries(newFields).forEach(([k, v]) => {
+        if (!fi.fields[k]) fi.fields[k] = {value: null, source: null, override: null, locked: false};
+        if (fi.fields[k].locked) return;  // protected — skip entirely
+        if (v && v.value != null) {
+          fi.fields[k].value  = v.value;
+          fi.fields[k].source = v.source || fi.fields[k].source;
+        }
+        // Always carry through extra keys (perpetuity, perpetuity_note)
+        Object.keys(v || {}).forEach(prop => {
+          if (prop !== 'value' && prop !== 'source' && prop !== 'override') {
+            fi.fields[k][prop] = v[prop];
+          }
+        });
+      });
+    }
+
     function setupDropZone(el, onFiles) {
-      el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('drag-over'); });
+      el.addEventListener('dragenter', (e) => { e.preventDefault(); el.classList.add('drag-over'); });
+      el.addEventListener('dragover',  (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; el.classList.add('drag-over'); });
       el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('drag-over'); });
       el.addEventListener('drop', (e) => {
         e.preventDefault(); el.classList.remove('drag-over');
-        const files = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf') || f.name.toLowerCase().endsWith('.xlsx') || f.name.toLowerCase().endsWith('.docx'));
-        if (files.length) onFiles(files); else showError('Drop PDF, XLSX, or DOCX files only.');
+        const rawFiles = e.dataTransfer && e.dataTransfer.files ? Array.from(e.dataTransfer.files) : [];
+        const files = rawFiles.filter(f => /\.(pdf|xlsx|docx)$/i.test(f.name));
+        if (files.length) onFiles(files); else showFundInfoError('Drop PDF, XLSX, or DOCX files only.');
       });
     }
 
@@ -711,8 +759,18 @@ HTML = r"""<!DOCTYPE html>
       });
     }
 
+    const fundInfoErrorBox = document.getElementById('fundInfoErrorBox');
+
+    function showFundInfoError(msg) {
+      if (!msg) { fundInfoErrorBox.style.display = 'none'; fundInfoErrorBox.textContent = ''; return; }
+      fundInfoErrorBox.textContent = msg;
+      fundInfoErrorBox.style.display = 'block';
+      fundInfoErrorBox.scrollIntoView({behavior:'smooth', block:'nearest'});
+    }
+
     function showParseSpinner(msg) {
-      fundInfoParseMsg.textContent = msg || 'Parsing… (15–45 seconds)';
+      showFundInfoError('');
+      fundInfoParseMsg.textContent = msg || 'Parsing…';
       fundInfoParseStatus.style.display = 'flex';
     }
     function hideParseSpinner(msg) {
@@ -776,6 +834,7 @@ HTML = r"""<!DOCTYPE html>
         project_name: projectNameInput.value.trim() || 'Untitled project',
         memo_name: memoNameInput.value.trim() || '',
         memo_file_path: memoPathInput.value.trim(),
+        model_xlsx_path: modelXlsxPathInput.value.trim(),
         rules: rulesBox.value || '',
         issuer_aliases: aliasesBox.value || '',
         label_colors: labelColorsBox.value || '',
@@ -824,6 +883,7 @@ HTML = r"""<!DOCTYPE html>
       projectNameInput.value = project.project_name || 'Untitled project';
       memoNameInput.value = project.memo_name || '';
       memoPathInput.value = project.memo_file_path || '';
+      modelXlsxPathInput.value = project.model_xlsx_path || '';
       rulesBox.value = project.rules || '';
       aliasesBox.value = project.issuer_aliases || '';
       labelColorsBox.value = project.label_colors || '';
@@ -852,6 +912,7 @@ HTML = r"""<!DOCTYPE html>
       appState.result = null;
       fillProjectForm(data.project);
       memoPathInput.value = '';
+      modelXlsxPathInput.value = '';
       fundList.innerHTML = '';
       resultsPane.innerHTML = '<div class="small-note">New project started. Add a fund to begin.</div>';
       await loadProjectList(data.project.project_id);
@@ -865,6 +926,7 @@ HTML = r"""<!DOCTYPE html>
         projectNameInput.value = '';
         memoNameInput.value = '';
         memoPathInput.value = '';
+        modelXlsxPathInput.value = '';
         rulesBox.value = '';
         aliasesBox.value = '';
         labelColorsBox.value = '';
@@ -990,7 +1052,7 @@ HTML = r"""<!DOCTYPE html>
       lines.forEach((rawLine) => {
         const line = rawLine.trim();
         if (!line) return;
-        const match = line.match(/^(geography|asset\s*class|asset_class|security\s*type|security_type|sub\s*asset\s*class|sub_asset_class)\s*[:=]\s*(.+)$/i);
+        const match = line.match(/^(geography|asset\s*class|asset_class|security\s*type|security_type)\s*[:=]\s*(.+)$/i);
         const family = match ? match[1] : 'geography';
         const payload = match ? match[2] : line;
         const rows = payload.split(/[;,]/).map((part) => part.trim()).filter(Boolean).map((part) => {
@@ -1271,6 +1333,37 @@ HTML = r"""<!DOCTYPE html>
       }
     }
 
+    async function browseModel() {
+      const resp = await fetch('/api/pick_file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({filter: 'excel'}) });
+      const data = await resp.json();
+      if (data.error) showError(data.error);
+      if (data.path) {
+        modelXlsxPathInput.value = data.path;
+        if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
+      }
+    }
+
+    async function updateModelOutputs() {
+      if (!appState.project) { showError('Start or open a project first.'); return; }
+      if (!memoPathInput.value.trim()) { showError('Point to a memo file first (Browse next to "Memo file").'); return; }
+      if (!modelXlsxPathInput.value.trim()) { showError('Enter the Excel model filepath first.'); return; }
+      const payload = {...projectPayloadFromState(), fund_infos: getFundInfos()};
+      updateModelOutputsBtn.disabled = true;
+      setProjectStatus('Updating model outputs in memo…');
+      try {
+        const resp = await fetch('/api/projects/update_model_outputs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Unable to update model outputs.');
+        setProjectStatus('Model outputs updated in: ' + (data.memo_file_path || 'memo'));
+      } finally {
+        updateModelOutputsBtn.disabled = false;
+      }
+    }
+
     async function refreshSheetPreview(uploadId, sheetName, headerMode) {
       const resp = await fetch('/api/preview', {
         method: 'POST',
@@ -1287,7 +1380,6 @@ HTML = r"""<!DOCTYPE html>
         target.header_mode = data.header_mode || headerMode || 'auto';
         target.preview = data;
         target.mapping = data.suggested_columns;
-        target.mapping.sub_asset_class = target.mapping.security_type || target.mapping.sub_asset_class || null;
       }
       renderFunds();
     }
@@ -1394,9 +1486,8 @@ HTML = r"""<!DOCTYPE html>
       });
 
       const mappingGrid = node.querySelector('.fund-mapping');
-      const mappingFields = ['investment_name', 'record_date_nav', 'asset_class', 'security_type', 'geography', 'sub_asset_class'];
+      const mappingFields = ['investment_name', 'record_date_nav', 'asset_class', 'security_type', 'geography'];
       let securityTypeSelect = null;
-      let subAssetClassSelect = null;
       mappingFields.forEach((field) => {
         const wrapper = document.createElement('div');
         wrapper.className = 'field';
@@ -1408,30 +1499,16 @@ HTML = r"""<!DOCTYPE html>
         select.addEventListener('change', () => {
           fund.mapping = fund.mapping || {};
           fund.mapping[field] = select.value || null;
-          if (field === 'security_type' && subAssetClassSelect) {
-            subAssetClassSelect.value = select.value || '';
-            fund.mapping.sub_asset_class = select.value || null;
-          }
           scheduleProjectSave();
           scheduleChartRefresh();
         });
         if (field === 'security_type') {
           securityTypeSelect = select;
         }
-        if (field === 'sub_asset_class') {
-          subAssetClassSelect = select;
-          select.disabled = true;
-          select.title = 'Mirrors security type';
-          select.value = (fund.mapping || {}).security_type || '';
-        }
         wrapper.appendChild(label);
         wrapper.appendChild(select);
         mappingGrid.appendChild(wrapper);
       });
-
-      if (securityTypeSelect && subAssetClassSelect) {
-        subAssetClassSelect.value = securityTypeSelect.value || '';
-      }
 
       const previewTable = node.querySelector('.preview-table');
       if (fund.preview) {
@@ -1489,7 +1566,6 @@ HTML = r"""<!DOCTYPE html>
       card.querySelectorAll('.fund-mapping select').forEach((select) => {
         columnMap[select.dataset.field] = select.value || null;
       });
-      columnMap.sub_asset_class = columnMap.security_type || columnMap.sub_asset_class || null;
       return {
         upload_id: uploadId,
         filename: fund.filename,
@@ -1561,18 +1637,18 @@ HTML = r"""<!DOCTYPE html>
         ['asset_class', 'Asset class exposure'],
         ['security_type', 'Security type exposure'],
         ['geography', 'Geography exposure'],
-        ['sub_asset_class', 'Sub-asset class exposure'],
       ];
       const chartHtml = '<div class="charts">' + familyOrder
         .filter(([family]) => (data.categories[family] || []).length)
         .map(([family, title]) => renderCategoryCard(family, title, data.categories[family]))
         .join('') + '</div>';
+      const perFundHtml = renderPerFundExposure(data.fund_profiles || [], data.categories || {}, data.top_positions || []);
       const topPositionsHtml = renderBarCard('Top positions', data.top_positions.slice(0, 15));
       const concentrationTableHtml = renderConcentrationTable(data);
       const mergesHtml = renderMergesCard(data.position_merges || [], data.position_merge_suggestions || []);
       const fundTableHtml = renderFundTable(data.funds);
 
-      resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + '<div class="section-gap"></div>' + concentrationTableHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
+      resultsPane.innerHTML = sentence + statHtml + '<div class="section-gap"></div>' + chartHtml + (perFundHtml ? '<div class="section-gap"></div>' + perFundHtml : '') + '<div class="section-gap"></div>' + concentrationTableHtml + '<div class="section-gap"></div>' + topPositionsHtml + '<div class="section-gap"></div>' + mergesHtml + '<div class="section-gap"></div>' + fundTableHtml;
     }
 
     function autoFillLabelColors(data) {
@@ -1638,11 +1714,18 @@ HTML = r"""<!DOCTYPE html>
           const val = getEffective(f);
           const src = f.source || '';
           const perp = key === 'extensions' && f.perpetuity ? ' *' : '';
+          const locked = !!f.locked;
+          const lockCls = locked ? 'locked' : '';
+          const lockTitle = locked ? 'Locked — click to unlock' : 'Lock to protect from parse overwrites';
           html += `<td>
-            <input type="text" class="fi-cell" data-fund="${escapeHtml(fname)}" data-field="${key}"
-              value="${escapeHtml(String(val !== null && val !== undefined ? val : ''))}"
-              placeholder="${src ? '(parsed)' : ''}" style="width:90px"/>
-            ${src ? `<span title="${escapeHtml(src)}" style="cursor:help;color:var(--accent);font-size:11px"> ⓘ</span>${perp}` : perp}
+            <div style="display:flex;align-items:center;gap:2px;">
+              <input type="text" class="fi-cell ${lockCls}" data-fund="${escapeHtml(fname)}" data-field="${key}"
+                value="${escapeHtml(String(val !== null && val !== undefined ? val : ''))}"
+                placeholder="${src ? '(parsed)' : ''}" style="width:82px"/>
+              <button class="fi-lock-btn ${lockCls}" data-fund="${escapeHtml(fname)}" data-field="${key}"
+                title="${escapeHtml(lockTitle)}">${locked ? '🔒' : '🔓'}</button>
+              ${src ? `<span title="${escapeHtml(src)}" style="cursor:help;color:var(--accent);font-size:11px">ⓘ</span>${perp}` : perp}
+            </div>
           </td>`;
         });
         html += '</tr>';
@@ -1660,6 +1743,18 @@ HTML = r"""<!DOCTYPE html>
           const v = input.value.trim();
           fis2[fname].fields[field].override = v === '' ? null : v;
           saveFundInfos(fis2);
+        });
+      });
+      fundInfoTableWrap.querySelectorAll('.fi-lock-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const fname = btn.dataset.fund;
+          const field = btn.dataset.field;
+          const fis2 = getFundInfos();
+          if (!fis2[fname]) fis2[fname] = {scale_pct:100, fields:{}};
+          if (!fis2[fname].fields[field]) fis2[fname].fields[field] = {value:null,source:null,override:null,locked:false};
+          fis2[fname].fields[field].locked = !fis2[fname].fields[field].locked;
+          saveFundInfos(fis2);
+          renderFundInfoTable();
         });
       });
       fundInfoTableWrap.querySelectorAll('.fi-scale').forEach((input) => {
@@ -1684,12 +1779,14 @@ HTML = r"""<!DOCTYPE html>
         const safeF = fname.replace(/"/g, '&quot;');
         const ql = fi.quarterly_letter_path || '';
         const afs = fi.afs_path || '';
+        const cas = fi.cas_path || '';
         const lpa = fi.lpa_path || '';
         html += `<div class="chart-card" style="margin-bottom:10px;">
           <h3>${escapeHtml(fname)} — Documents</h3>
           <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
             ${docRow(fname,'quarterly_letter','Quarterly Letter', ql)}
             ${docRow(fname,'afs','Audited Financials (AFS)', afs)}
+            ${docRow(fname,'cas','Capital Account Statement (CAS)', cas)}
             ${docRow(fname,'lpa','LPA', lpa)}
           </div>
         </div>`;
@@ -1722,7 +1819,7 @@ HTML = r"""<!DOCTYPE html>
 
     async function uploadFundDoc(fname, dtype, file) {
       if (!file || !appState.project) return;
-      showError('');
+      showFundInfoError('');
       const form = new FormData();
       form.append('project_id', appState.project.project_id || '');
       form.append('fund_name', fname);
@@ -1730,7 +1827,7 @@ HTML = r"""<!DOCTYPE html>
       form.append('file', file);
       const r = await fetch('/api/fund_info/upload_doc', {method:'POST', body:form});
       const d = await r.json();
-      if (!r.ok) { showError(d.error || 'Upload failed'); return; }
+      if (!r.ok) { showFundInfoError(d.error || 'Upload failed'); return; }
       const fis = getFundInfos();
       if (!fis[fname]) fis[fname] = {scale_pct:100, fields:{}};
       fis[fname][dtype + '_path'] = d.path;
@@ -1753,64 +1850,57 @@ HTML = r"""<!DOCTYPE html>
         }
       }
       const path = (fis[fname] || {})[dtype + '_path'];
-      if (!path) { showError(`No ${dtype} file set for ${fname}. Upload or paste a path first.`); return; }
+      if (!path) { showFundInfoError(`No ${dtype} file set for ${fname}. Upload or paste a path first.`); return; }
       const apiKey = openaiKeyInput.value.trim();
-      if (!apiKey) { showError('Enter your OpenAI API key first.'); return; }
+      if (!apiKey) { showFundInfoError('Enter your OpenAI API key first.'); return; }
       const origText = btn.textContent;
       btn.disabled = true; btn.textContent = 'Parsing…';
-      const docLabel = {'quarterly_letter':'quarterly letter','afs':'AFS','lpa':'LPA'}[dtype] || dtype;
-      showParseSpinner(`Parsing ${docLabel} for ${fname}… (15–45 seconds)`);
-      showError('');
+      const docLabel = {'quarterly_letter':'quarterly letter','afs':'AFS','cas':'CAS','lpa':'LPA'}[dtype] || dtype;
+      showParseSpinner(`Parsing ${docLabel} for ${fname}…`);
       try {
         const r = await fetch('/api/fund_info/parse', {method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({project_id:appState.project.project_id,fund_name:fname,doc_type:dtype,file_path:path,api_key:apiKey})});
         const d = await r.json();
-        if (!r.ok) { showError(d.error || 'Parse failed'); return; }
+        if (!r.ok) { hideParseSpinner(); showFundInfoError(d.error || 'Parse failed'); return; }
         const fis2 = getFundInfos();
         if (!fis2[fname]) fis2[fname] = {scale_pct:100, fields:{}};
-        Object.entries(d.fields || {}).forEach(([k, v]) => {
-          if (!fis2[fname].fields[k]) fis2[fname].fields[k] = {value:null,source:null,override:null};
-          Object.assign(fis2[fname].fields[k], v);
-        });
+        mergeFields(fis2[fname], d.fields || {});
         saveFundInfos(fis2);
         renderFundInfoTable();
         const populated = Object.entries(d.fields || {}).filter(([,v])=>v&&v.value!=null).map(([k])=>k).join(', ');
         hideParseSpinner(`✓ Parsed ${docLabel} for ${fname}${populated ? ' — populated: ' + populated : ''}.`);
-      } catch(e) { hideParseSpinner(); showError(e.message || String(e)); }
+      } catch(e) { hideParseSpinner(); showFundInfoError(e.message || String(e)); }
       finally { btn.disabled = false; btn.textContent = origText; }
     }
 
     async function parseProjFiles() {
       if (!appState.project || !appState.result) return;
       const apiKey = openaiKeyInput.value.trim();
-      if (!apiKey) { showError('Enter your OpenAI API key first.'); return; }
+      if (!apiKey) { showFundInfoError('Enter your OpenAI API key first.'); return; }
       const paths = appState.project.project_file_paths || [];
-      if (!paths.length) { showError('Upload or add project files first.'); return; }
+      if (!paths.length) { showFundInfoError('Upload or add project files first.'); return; }
       const fundNames = (appState.result.fund_profiles || []).map(fp => fp.fund_name || fp.filename || '').filter(Boolean);
       parseProjFilesBtn.disabled = true; parseProjFilesBtn.textContent = 'Parsing…';
-      showParseSpinner(`Scanning folder and parsing all fields for ${fundNames.length} fund(s)… (~30–60 seconds per fund)`);
+      showParseSpinner(`Scanning and parsing all fields for ${fundNames.length} fund(s)…`);
       try {
         const r = await fetch('/api/fund_info/parse_project', {method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({project_id:appState.project.project_id,file_paths:paths,fund_names:fundNames,api_key:apiKey})});
         const d = await r.json();
-        if (!r.ok) { showError(d.error || 'Parse failed'); return; }
+        if (!r.ok) { hideParseSpinner(); showFundInfoError(d.error || 'Parse failed'); return; }
         const fis = getFundInfos();
         let populated = 0;
         Object.entries(d.results || {}).forEach(([fname, extracted]) => {
           if (!fis[fname]) fis[fname] = {scale_pct:100, fields:{}};
-          Object.entries(extracted || {}).forEach(([k, v]) => {
-            if (!fis[fname].fields[k]) fis[fname].fields[k] = {value:null,source:null,override:null};
-            Object.assign(fis[fname].fields[k], v);
-            if (v && v.value != null) populated++;
-          });
+          mergeFields(fis[fname], extracted || {});
+          populated += Object.values(extracted || {}).filter(v => v && v.value != null).length;
         });
         saveFundInfos(fis);
         renderFundInfoTable();
         const filesNote = d.files_used && d.files_used.length ? ` from ${d.files_used.length} file(s): ${d.files_used.slice(0,3).join(', ')}${d.files_used.length>3?'…':''}` : '';
         hideParseSpinner(`✓ Project files parsed — ${populated} value(s) populated across ${fundNames.length} fund(s)${filesNote}.`);
-      } catch(e) { hideParseSpinner(); showError(e.message || String(e)); }
+      } catch(e) { hideParseSpinner(); showFundInfoError(e.message || String(e)); }
       finally { parseProjFilesBtn.disabled = false; parseProjFilesBtn.textContent = 'Parse project files'; }
     }
 
@@ -1910,7 +2000,7 @@ HTML = r"""<!DOCTYPE html>
       if (family === 'geography') {
         return GEOGRAPHY_COLORS[label] || ['#4f6fb5', '#c27c3d', '#8a4f69'][index % 3];
       }
-      const assetClass = family === 'security_type' || family === 'sub_asset_class'
+      const assetClass = family === 'security_type'
         ? assetClassForSecurityType(label)
         : label;
       return ASSET_CLASS_COLORS[assetClass] || ['#1f5f74', '#8b5e3c', '#5d7d4e'][index % 3];
@@ -1951,6 +2041,62 @@ HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       `;
+    }
+
+    function renderPerFundExposure(fundProfiles, blendedCategories, topPositions) {
+      if (!fundProfiles || fundProfiles.length === 0) return '';
+      const totalProjectPositions = (topPositions || []).length;
+      const posRows = fundProfiles.map(fp =>
+        `<tr><td>${escapeHtml(fp.fund_name || fp.filename)}</td><td style="text-align:right">${pct(fp.weight)} of bid</td><td style="text-align:right">${fp.positions ?? '—'}</td></tr>`
+      ).join('');
+      const posCard = `<div class="chart-card">
+        <h3>Positions by fund</h3>
+        <div class="preview-wrap">
+          <table>
+            <thead><tr><th>Fund</th><th style="text-align:right">Bid weight</th><th style="text-align:right">Positions</th></tr></thead>
+            <tbody>
+              ${posRows}
+              <tr style="font-weight:600;border-top:2px solid #e5e7eb">
+                <td>Total (project)</td><td></td><td style="text-align:right">${totalProjectPositions}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+      const families = [
+        ['asset_class', 'Asset class'],
+        ['security_type', 'Security type'],
+        ['geography', 'Geography'],
+      ];
+      const cards = families.map(([family, title]) => {
+        // Use blended order so rows match the donut chart order above
+        const blendedOrder = (blendedCategories[family] || []).map(i => i.label);
+        const allLabels = new Set(blendedOrder);
+        fundProfiles.forEach(fp => (fp.categories[family] || []).forEach(i => allLabels.add(i.label)));
+        const extraLabels = Array.from(allLabels).filter(l => !blendedOrder.includes(l)).sort();
+        const labels = [...blendedOrder, ...extraLabels];
+        if (!labels.length) return '';
+        const headers = '<th>Category</th>' + fundProfiles.map(fp =>
+          `<th style="text-align:right">${escapeHtml(fp.fund_name || fp.filename)}<br><span style="font-weight:normal;color:#888;font-size:0.85em">${pct(fp.weight)} of bid</span></th>`
+        ).join('');
+        const rows = labels.map(label => {
+          const cells = fundProfiles.map(fp => {
+            const item = (fp.categories[family] || []).find(i => i.label === label);
+            return `<td style="text-align:right">${item ? pct(item.percentage) : '<span style="color:#ccc">—</span>'}</td>`;
+          }).join('');
+          return `<tr><td>${escapeHtml(label)}</td>${cells}</tr>`;
+        }).join('');
+        return `<div class="chart-card">
+          <h3>${escapeHtml(title)} by fund</h3>
+          <div class="preview-wrap">
+            <table>
+              <thead><tr>${headers}</tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>`;
+      }).filter(Boolean);
+      return '<div class="charts">' + posCard + (cards.length ? cards.join('') : '') + '</div>';
     }
 
     function donutSlice(cx, cy, r, inner, startDeg, endDeg, color) {
@@ -2152,6 +2298,7 @@ HTML = r"""<!DOCTYPE html>
     addFundBtn.addEventListener('click', addFund);
     updateExposuresBtn.addEventListener('click', () => updateExposures().catch((err) => showError(err.message || String(err))));
     updateFundInfoBtn.addEventListener('click', () => updateFundInfo().catch((err) => showError(err.message || String(err))));
+    updateModelOutputsBtn.addEventListener('click', () => updateModelOutputs().catch((err) => showError(err.message || String(err))));
     updateAllBtn.addEventListener('click', () => updateAll().catch((err) => showError(err.message || String(err))));
     parseProjFilesBtn.addEventListener('click', () => parseProjFiles().catch((err) => showError(err.message || String(err))));
     openaiKeyInput.addEventListener('input', () => { if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); } });
@@ -2172,6 +2319,10 @@ HTML = r"""<!DOCTYPE html>
     });
     browseMemoBtn.addEventListener('click', () => browseMemo().catch((err) => showError(err.message || String(err))));
     memoPathInput.addEventListener('input', () => {
+      if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
+    });
+    browseModelBtn.addEventListener('click', () => browseModel().catch((err) => showError(err.message || String(err))));
+    modelXlsxPathInput.addEventListener('input', () => {
       if (appState.project) { setProjectStatus('Unsaved changes'); scheduleProjectSave(); }
     });
     calcBtn.addEventListener('click', calculate);
@@ -2275,6 +2426,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/projects/update_fund_info":
                 self._handle_project_update_fund_info()
+                return
+            if self.path == "/api/projects/update_model_outputs":
+                self._handle_model_outputs_update()
                 return
             self._send_json(404, {"error": "Not found"})
         except Exception as exc:
@@ -2389,6 +2543,8 @@ class Handler(BaseHTTPRequestHandler):
             project["fund_infos"] = payload.get("fund_infos") or {}
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
+        if payload.get("model_xlsx_path") is not None:
+            project["model_xlsx_path"] = payload.get("model_xlsx_path") or ""
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
@@ -2417,7 +2573,7 @@ class Handler(BaseHTTPRequestHandler):
             project["fund_infos"] = payload.get("fund_infos") or {}
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
-        memo_path = project.get("memo_file_path") or ""
+        memo_path = (project.get("memo_file_path") or "").strip().strip('"').strip("'")
         if not memo_path:
             raise ValueError("Point to a memo file first (use Browse next to 'Memo file').")
         if not Path(memo_path).exists():
@@ -2541,7 +2697,6 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     "mapping": {
                         **preview["suggested_columns"],
-                        "sub_asset_class": preview["suggested_columns"].get("security_type"),
                     },
                 }
             )
@@ -2631,7 +2786,6 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     "mapping": fund.get("column_map") or {
                         **preview["suggested_columns"],
-                        "sub_asset_class": preview["suggested_columns"].get("security_type"),
                     },
                     "fund_name": fund.get("fund_name") or fund.get("filename") or "Untitled fund",
                     "bid_amount": fund.get("bid_amount") or 0,
@@ -2698,6 +2852,27 @@ class Handler(BaseHTTPRequestHandler):
             paths.append(str(dest))
         self._send_json(200, {"paths": paths})
 
+    @staticmethod
+    def _resolve_file_path(raw: str) -> Path:
+        """Strip surrounding quotes and validate the path is readable."""
+        p = Path(raw.strip().strip('"').strip("'"))
+        if not p.exists():
+            hint = (
+                " It looks like a cloud-only OneDrive file — right-click it in "
+                "Explorer → 'Always keep on this device', then retry."
+                if "onedrive" in str(p).lower() else ""
+            )
+            raise ValueError(f"File not found: {p.name}.{hint}")
+        try:
+            with open(str(p), "rb") as fh:
+                fh.read(4)
+        except OSError:
+            raise ValueError(
+                f"Cannot open {p.name} — it may be a cloud-only OneDrive file. "
+                "Right-click it in Explorer → 'Always keep on this device', then retry."
+            )
+        return p
+
     def _handle_fund_info_parse(self):
         import fund_info as fi_mod
         payload = self._read_json()
@@ -2705,16 +2880,20 @@ class Handler(BaseHTTPRequestHandler):
         doc_type  = payload.get("doc_type") or ""
         file_path = payload.get("file_path") or ""
         api_key   = payload.get("api_key") or ""
-        if not file_path or not Path(file_path).exists():
-            raise ValueError(f"File not found: {file_path}")
+        if not file_path:
+            raise ValueError("No file path provided")
+        resolved = self._resolve_file_path(file_path)
         if not api_key:
             raise ValueError("OpenAI API key required")
+        rpath = str(resolved)
         if doc_type == "quarterly_letter":
-            result = fi_mod.parse_quarterly_letter(file_path, api_key, fund_name)
+            result = fi_mod.parse_quarterly_letter(rpath, api_key, fund_name)
         elif doc_type == "afs":
-            result = fi_mod.parse_afs(file_path, api_key, fund_name)
+            result = fi_mod.parse_afs(rpath, api_key, fund_name)
+        elif doc_type == "cas":
+            result = fi_mod.parse_cas(rpath, api_key, fund_name)
         elif doc_type == "lpa":
-            result = fi_mod.parse_lpa(file_path, api_key, fund_name)
+            result = fi_mod.parse_lpa(rpath, api_key, fund_name)
         else:
             raise ValueError(f"Unknown doc_type: {doc_type}")
         if "error" in result:
@@ -2743,7 +2922,7 @@ class Handler(BaseHTTPRequestHandler):
             project["fund_infos"] = payload.get("fund_infos") or {}
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
-        memo_path = project.get("memo_file_path") or ""
+        memo_path = (project.get("memo_file_path") or "").strip().strip('"').strip("'")
         if not memo_path:
             raise ValueError("Point to a memo file first.")
         if not Path(memo_path).exists():
@@ -2760,6 +2939,40 @@ class Handler(BaseHTTPRequestHandler):
             update_sections_in_file(memo_path, result, sections=("fund_info",), project=saved)
         except PermissionError:
             raise ValueError("Memo is open in Word — close it and try again.")
+        self._send_json(200, {"ok": True, "memo_file_path": memo_path})
+
+    def _handle_model_outputs_update(self):
+        import model_reader
+        payload = self._read_json()
+        project_id = payload.get("project_id")
+        if not project_id:
+            raise ValueError("Project id is required")
+        project = load_project(project_id)
+        if payload.get("memo_file_path") is not None:
+            project["memo_file_path"] = payload.get("memo_file_path") or ""
+        if payload.get("model_xlsx_path") is not None:
+            project["model_xlsx_path"] = payload.get("model_xlsx_path") or ""
+        memo_path = (project.get("memo_file_path") or "").strip().strip('"').strip("'")
+        if not memo_path:
+            raise ValueError("Point to a memo file first.")
+        if not Path(memo_path).exists():
+            raise ValueError(f"Memo file not found: {memo_path}")
+        xlsx_path = (project.get("model_xlsx_path") or "").strip().strip('"').strip("'")
+        if not xlsx_path:
+            raise ValueError("Enter the Excel model filepath first.")
+        if not Path(xlsx_path).exists():
+            raise ValueError(f"Model file not found: {xlsx_path}")
+        saved = save_project(project)
+        try:
+            model_outputs = model_reader.read_model_outputs(xlsx_path)
+            update_sections_in_file(
+                memo_path,
+                {"_model_outputs": model_outputs},
+                sections=("model_outputs",),
+                project=saved,
+            )
+        except PermissionError:
+            raise ValueError("Could not write the memo — is it open in Word? Close it and try again.")
         self._send_json(200, {"ok": True, "memo_file_path": memo_path})
 
     def _handle_download_positions_excel(self):

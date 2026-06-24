@@ -12,3 +12,7 @@ restart_err.log
 
 # large source docs (keep out of git; they live on OneDrive)
 source_docs/
+
+# scratch / test files
+_*.docx
+_*.py

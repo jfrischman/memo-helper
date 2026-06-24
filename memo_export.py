@@ -222,11 +222,20 @@ def _compute_top_concentration(items: Sequence[Dict[str, Any]],
 
 
 def _rebuild_concentration_table(table, result: Dict[str, Any]) -> None:
-    """Replace all data rows in the concentration table to match fund count."""
+    """Completely rebuild the concentration table with a clean 6-column grid.
+
+    The memo template may have a wide gridCol structure (e.g. 29 columns with
+    large cell spans) that causes partial overwrites when only 6 values are
+    written. We avoid this by wiping the grid and all rows and starting fresh.
+    """
+    import copy
+    from lxml import etree as _et
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
     fund_profiles = result.get("fund_profiles") or []
     top = result.get("top_concentration") or {}
 
-    # Build data: [Total row, then one row per fund]
+    headers = ["Top Positions", "Top 1", "Top 3", "Top 5", "Top 10", "Remaining"]
     data_rows = [["Total", _fmt_pct(top.get("top_1", 0)), _fmt_pct(top.get("top_3", 0)),
                   _fmt_pct(top.get("top_5", 0)), _fmt_pct(top.get("top_10", 0)),
                   _fmt_pct(top.get("remaining", 0))]]
@@ -238,31 +247,82 @@ def _rebuild_concentration_table(table, result: Dict[str, Any]) -> None:
                           _fmt_pct(p["top_5"]), _fmt_pct(p["top_10"]),
                           _fmt_pct(p["remaining"])])
 
-    # Header row is row[0]; data starts at row[1]
     tbl = table._tbl
-    existing_data_rows = list(tbl.tr_lst)[1:]   # all rows after header
-    n_need = len(data_rows)
-    n_have = len(existing_data_rows)
+    n_cols = 6
+    col_widths = ["2200", "1100", "1100", "1100", "1100", "1200"]  # twips
 
-    # Remove surplus rows
-    for tr in existing_data_rows[n_need:]:
+    # Reset tblGrid to exactly 6 columns
+    tblGrid = tbl.find(f"{{{W}}}tblGrid")
+    if tblGrid is None:
+        tblGrid = _et.SubElement(tbl, f"{{{W}}}tblGrid")
+    for gc in list(tblGrid.findall(f"{{{W}}}gridCol")):
+        tblGrid.remove(gc)
+    for w in col_widths:
+        gc = _et.SubElement(tblGrid, f"{{{W}}}gridCol")
+        gc.set(f"{{{W}}}w", w)
+
+    # Grab a prototype cell from the existing table for border/shading styles
+    existing_trs = list(tbl.findall(f"{{{W}}}tr"))
+    proto_tc = None
+    for tr in existing_trs:
+        tcs = tr.findall(f"{{{W}}}tc")
+        for tc in tcs:
+            # Remove any gridSpan so the prototype is a plain 1-col cell
+            tcPr = tc.find(f"{{{W}}}tcPr")
+            if tcPr is not None:
+                for gs in tcPr.findall(f"{{{W}}}gridSpan"):
+                    tcPr.remove(gs)
+            proto_tc = copy.deepcopy(tc)
+            # Strip text content
+            for p_el in list(proto_tc.findall(f"{{{W}}}p")):
+                proto_tc.remove(p_el)
+            _et.SubElement(proto_tc, f"{{{W}}}p")
+            break
+        if proto_tc is not None:
+            break
+
+    if proto_tc is None:
+        proto_tc = OxmlElement("w:tc")
+        proto_tc.append(OxmlElement("w:p"))
+
+    def _make_tr(n: int):
+        # OxmlElement("w:tr") produces a CT_Row instance (has tc_lst, used by row.cells)
+        tr = OxmlElement("w:tr")
+        for _ in range(n):
+            tr.append(copy.deepcopy(proto_tc))
+        return tr
+
+    # Remove all existing rows and rebuild
+    for tr in list(existing_trs):
         tbl.remove(tr)
 
-    # Add missing rows (clone header row structure)
-    header_tr = tbl.tr_lst[0]
-    for _ in range(n_need - n_have):
-        import copy
-        new_tr = copy.deepcopy(header_tr)
-        tbl.append(new_tr)
+    # Header row (italic column titles, light green background)
+    hdr_tr = _make_tr(n_cols)
+    tbl.append(hdr_tr)
+    hdr_row = table.rows[0]
+    for ci, hdr in enumerate(headers):
+        bold = ci == 0
+        _set_cell_text(hdr_row.cells[ci], hdr,
+                       align=WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else None,
+                       bold=bold, italic=not bold, font_pt=8)
+        _set_cell_shading(hdr_row.cells[ci], "DDE8CB")  # light green like template
+        hdr_row.cells[ci].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
-    # Write values into rows 1..n
+    # Data rows
+    for row_vals in data_rows:
+        tbl.append(_make_tr(n_cols))
     for i, row_vals in enumerate(data_rows):
         row = table.rows[i + 1]
         for ci, val in enumerate(row_vals):
-            if ci < len(row.cells):
-                _set_cell_text(row.cells[ci], val,
-                               align=WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else None)
-                row.cells[ci].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            cell = row.cells[ci]
+            _set_cell_text(cell, val,
+                           align=WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else None,
+                           font_pt=8)
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            # Remove any inherited fill from the prototype cell
+            tcPr = cell._tc.get_or_add_tcPr()
+            for shd in tcPr.findall(qn("w:shd")):
+                tcPr.remove(shd)
 
     _format_table(table, center_from_col=1)
 
@@ -285,8 +345,7 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
 
     asset_vals = {it["label"]: float(it.get("value") or it.get("percentage") or 0)
                   for it in categories.get("asset_class", [])}
-    # Use sub_asset_class; fall back to security_type if not populated
-    sub_src = categories.get("sub_asset_class") or categories.get("security_type") or []
+    sub_src = categories.get("security_type") or []
     sub_vals = {it["label"]: float(it.get("value") or it.get("percentage") or 0)
                 for it in sub_src}
 
@@ -303,7 +362,7 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
 
     def fund_sub(fi: int, label: str) -> str:
         fp_cats = fund_profiles[fi].get("categories") or {}
-        cats = fp_cats.get("sub_asset_class") or fp_cats.get("security_type") or []
+        cats = fp_cats.get("security_type") or []
         m = {it["label"]: float(it.get("value") or it.get("percentage") or 0) for it in cats}
         return _fmt_pct0(m.get(label, 0.0))
 
@@ -400,12 +459,91 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
             _set_cell_no_wrap(row.cells[1])
 
 
+def _find_table_after_title(doc: Document, title: str):
+    """
+    Return the data table that follows a section title, scanning body elements
+    in document order. Handles two common memo structures:
+      - Title in a standalone paragraph → return the next table.
+      - Title in the first row of a small header table → return the table after that.
+    Returns None if the title is not found.
+    """
+    from docx.table import Table as _Table
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    title_lower = title.lower()
+    found = False
+    for el in doc.element.body:
+        is_tbl = el.tag == f"{{{W}}}tbl"
+        if is_tbl:
+            if found:
+                return _Table(el, doc)
+            # Check whether the table's first row is itself a title header
+            rows = [c for c in el if c.tag == f"{{{W}}}tr"]
+            if rows:
+                first_row_text = "".join(
+                    t.text or "" for t in rows[0].iter() if t.tag == f"{{{W}}}t"
+                ).lower()
+                if title_lower in first_row_text:
+                    found = True   # next table is the data table
+        else:
+            text = "".join(t.text or "" for t in el.iter() if t.tag == f"{{{W}}}t").lower()
+            if title_lower in text:
+                found = True
+    return None
+
+
+def _remove_duplicate_asset_tables(doc: Document, keep_el) -> None:
+    """Delete any tables other than keep_el whose first row contains both
+    'asset class' and 'sub-asset' cell text — i.e. stale Asset Type By Fund
+    tables left behind by previous update runs."""
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = doc.element.body
+    to_remove = []
+    for el in body:
+        if el.tag != f"{{{W}}}tbl" or el is keep_el:
+            continue
+        rows = [c for c in el if c.tag == f"{{{W}}}tr"]
+        if not rows:
+            continue
+        cell_texts = [
+            "".join(t.text or "" for t in tc.iter() if t.tag == f"{{{W}}}t").lower()
+            for tc in rows[0] if tc.tag == f"{{{W}}}tc"
+        ]
+        if (any("asset class" in s for s in cell_texts) and
+                any("sub-asset" in s for s in cell_texts)):
+            to_remove.append(el)
+    for el in to_remove:
+        body.remove(el)
+
+
+def _find_concentration_table(doc: Document):
+    """Find the Top Positions concentration table by title search, falling back to index 2."""
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    for el in doc.element.body:
+        if el.tag != f"{{{W}}}tbl":
+            continue
+        rows = [c for c in el if c.tag == f"{{{W}}}tr"]
+        if not rows:
+            continue
+        first_text = "".join(
+            t.text or "" for t in rows[0].iter() if t.tag == f"{{{W}}}t"
+        ).lower()
+        if "top position" in first_text or "top 1" in first_text:
+            from docx.table import Table as _Table
+            return _Table(el, doc)
+    return doc.tables[2] if len(doc.tables) >= 3 else None
+
+
 def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:
-    if len(doc.tables) < 4:
-        return
-    _rebuild_concentration_table(doc.tables[2], result)
-    _rebuild_asset_type_table(doc.tables[3], result)
     _apply_summary_stats(doc, result)
+    conc_tbl = _find_concentration_table(doc)
+    if conc_tbl is not None:
+        _rebuild_concentration_table(conc_tbl, result)
+    asset_type_tbl = _find_table_after_title(doc, "Asset Type By Fund")
+    if asset_type_tbl is None and len(doc.tables) >= 4:
+        asset_type_tbl = doc.tables[3]   # positional fallback for Project Balance layout
+    if asset_type_tbl is not None:
+        _rebuild_asset_type_table(asset_type_tbl, result)
+        _remove_duplicate_asset_tables(doc, asset_type_tbl._tbl)
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +706,10 @@ def _update_fund_summary_table(doc: Document, result: Dict[str, Any]) -> None:
             if ci >= len(row.cells):
                 break
             align = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
-            _set_cell_text(row.cells[ci], val, align=align, font_pt=8)
+            _set_cell_text(row.cells[ci], val, align=align, font_pt=9)
             row.cells[ci].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
-    _format_table(table, center_from_col=1)
+    _format_table(table, center_from_col=1, font_pt=9)
 
     # Add / update perpetuity footnote paragraph immediately after table
     footnote_text = ""
@@ -618,10 +756,136 @@ def _apply_portfolio_names(doc: Document, result: Dict[str, Any]) -> None:
     _update_current_portfolio_names(doc, result, result.get("_project_name") or "Project")
 
 
+def _update_header_net_return(memo_path: Path, irr: float, moic: float) -> None:
+    """Replace the value after 'Base Case Expected Net Return: ' in header1.xml.
+    Uses direct ZIP manipulation because the header contains tracked-change runs."""
+    import zipfile, shutil, tempfile
+    from lxml import etree
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    new_text = f"{irr * 100:.1f}% / {moic:.2f}x"
+
+    tmp = Path(tempfile.mktemp(suffix=".docx"))
+    shutil.copy2(memo_path, str(tmp))
+    try:
+        with zipfile.ZipFile(str(tmp), "r") as zin:
+            names = zin.namelist()
+            if "word/header1.xml" not in names:
+                return
+            hdr_bytes = zin.read("word/header1.xml")
+            other = {n: zin.read(n) for n in names if n != "word/header1.xml"}
+
+        root = etree.fromstring(hdr_bytes)
+        label_text = "Base Case Expected Net Return: "
+
+        # Find the <w:r> whose <w:t> contains the label
+        label_run = None
+        label_para = None
+        for p_el in root.iter(f"{{{W}}}p"):
+            for r_el in p_el:
+                if r_el.tag != f"{{{W}}}r":
+                    continue
+                t_el = r_el.find(f"{{{W}}}t")
+                if t_el is not None and (t_el.text or "").strip().endswith("Net Return:") or \
+                   (t_el is not None and label_text.strip() in (t_el.text or "")):
+                    label_run = r_el
+                    label_para = p_el
+                    break
+            if label_run is not None:
+                break
+
+        if label_para is None or label_run is None:
+            return
+
+        # Copy the rPr from the label run to use as the template for the new value run
+        label_rPr = label_run.find(f"{{{W}}}rPr")
+
+        # Remove everything after the label run in this paragraph
+        children = list(label_para)
+        label_idx = children.index(label_run)
+        for child in children[label_idx + 1:]:
+            label_para.remove(child)
+
+        # Add a clean single run with the new value
+        new_r = etree.SubElement(label_para, f"{{{W}}}r")
+        if label_rPr is not None:
+            import copy
+            new_r.insert(0, copy.deepcopy(label_rPr))
+        new_t = etree.SubElement(new_r, f"{{{W}}}t")
+        new_t.text = new_text
+        new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+        new_hdr_bytes = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+        with zipfile.ZipFile(str(memo_path), "w", zipfile.ZIP_DEFLATED) as zout:
+            zout.writestr("word/header1.xml", new_hdr_bytes)
+            for n, data in other.items():
+                zout.writestr(n, data)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _apply_model_outputs(doc: Document, result: Dict[str, Any]) -> None:
+    """Update Investment Summary table (table[0]) with model outputs."""
+    model = result.get("_model_outputs")
+    if not model or not doc.tables:
+        return
+    t = doc.tables[0]
+    label_to_pos: Dict[str, tuple] = {}
+    for ri, row in enumerate(t.rows):
+        for ci, cell in enumerate(row.cells):
+            txt = cell.text.strip()
+            if txt:
+                label_to_pos[txt] = (ri, ci)
+
+    def set_next(label: str, value: str):
+        pos = label_to_pos.get(label)
+        if pos is None:
+            return
+        ri, ci = pos
+        try:
+            _set_cell_text(t.rows[ri].cells[ci + 1], value,
+                           align=WD_ALIGN_PARAGRAPH.CENTER, font_pt=9)
+        except (IndexError, Exception):
+            pass
+
+    def fmt_bid(v) -> str:
+        return f"{float(v) * 100:.1f}c"
+
+    def fmt_pct(v) -> str:
+        return f"{float(v) * 100:.1f}%"
+
+    def fmt_moic(v) -> str:
+        return f"{float(v):.2f}x"
+
+    if model.get("gross_bid") is not None:
+        set_next("Bid Price", fmt_bid(model["gross_bid"]))
+    if model.get("eff_bid") is not None:
+        set_next("Effective Price", fmt_bid(model["eff_bid"]))
+
+    base_irr = model.get("base_irr")
+    base_moic = model.get("base_moic")
+    if base_irr is not None and base_moic is not None:
+        set_next("Base IRR / MOIC", f"{fmt_pct(base_irr)} / {fmt_moic(base_moic)}")
+    elif base_irr is not None:
+        set_next("Base IRR / MOIC", fmt_pct(base_irr))
+
+    mgr_irr = model.get("mgr_irr")
+    bear_irr = model.get("bear_irr")
+    if mgr_irr is not None and bear_irr is not None:
+        set_next("Upside / Downside", f"{fmt_pct(mgr_irr)} / {fmt_pct(bear_irr)}")
+    elif mgr_irr is not None:
+        set_next("Upside / Downside", fmt_pct(mgr_irr))
+
+
 SECTION_UPDATERS = {
     "exposures": (_apply_exposure_tables, True),
     "portfolio_names": (_apply_portfolio_names, False),
     "fund_info": (_update_fund_summary_table, False),
+    "model_outputs": (_apply_model_outputs, False),
 }
 
 
@@ -659,4 +923,11 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
     if refresh_pies:
         lc = parse_label_colors((project or {}).get("label_colors") or "")
         update_native_pies(memo_path, result.get("categories", {}) or {}, label_colors=lc)
+    # Update header net return after saving (requires ZIP access)
+    if "model_outputs" in sections:
+        model = result.get("_model_outputs") or {}
+        base_irr = model.get("base_irr")
+        base_moic = model.get("base_moic")
+        if base_irr is not None and base_moic is not None:
+            _update_header_net_return(memo_path, base_irr, base_moic)
     return memo_path

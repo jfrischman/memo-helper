@@ -45,13 +45,6 @@ _FAMILY_ORDER: Dict[str, List[str]] = {
         "Consumer", "Hard Assets", "Specialty Lending",
         "Commercial RE (Equity)", "Commercial RE (Non-Perf)", "Equity",
     ],
-    "sub_asset_class": [
-        "Direct Lending", "Other Senior Lending", "Opportunistic / Junior",
-        "Distressed", "Corporate Equity",
-        "CLOs", "Regulatory Capital", "Commercial RE (Debt)", "Residential RE",
-        "Consumer", "Hard Assets", "Specialty Lending",
-        "Commercial RE (Equity)", "Commercial RE (Non-Perf)", "Equity",
-    ],
 }
 
 # Security type → asset class (so security-type slices inherit asset-class colors)
@@ -264,14 +257,162 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), notes
 
 
+def _build_chart_map_from_document(contents: Dict[str, bytes]) -> Dict[str, str]:
+    """
+    Identify the three exposure pie charts by their visual left-to-right position.
+
+    Reads the <wp:positionH> offset from each floating pie chart's <wp:anchor>
+    element, groups charts into left/middle/right horizontal buckets, and maps
+    them to asset_class/security_type/geography.
+
+    When a document contains duplicate pie chart sets (e.g. a secondary "legend"
+    set stacked above the main charts), multiple charts share the same H bucket.
+    Within each bucket the chart with the largest V offset is selected — it sits
+    furthest below its anchor paragraph and corresponds to the primary visible row.
+
+    Falls back to DEFAULT_CHART_MAP if fewer than 3 pie charts are found or the
+    horizontal positions cannot be parsed.
+    """
+    FAMILY_ORDER = ["asset_class", "security_type", "geography"]
+    R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+    WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+
+    # Build rId → chart part path from word/_rels/document.xml.rels
+    rels_bytes = contents.get("word/_rels/document.xml.rels")
+    if not rels_bytes:
+        return dict(DEFAULT_CHART_MAP)
+    try:
+        rels_root = etree.fromstring(rels_bytes)
+    except Exception:
+        return dict(DEFAULT_CHART_MAP)
+
+    rid_to_part: Dict[str, str] = {}
+    for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
+        if "chart" not in rel.get("Type", "").lower():
+            continue
+        rid = rel.get("Id", "")
+        target = rel.get("Target", "")
+        if not rid or not target:
+            continue
+        if target.startswith("../"):
+            target = "word/" + target[3:]
+        elif not target.startswith("word/"):
+            target = "word/" + target
+        rid_to_part[rid] = target
+
+    doc_bytes = contents.get("word/document.xml")
+    if not doc_bytes:
+        return dict(DEFAULT_CHART_MAP)
+    try:
+        doc_root = etree.fromstring(doc_bytes)
+    except Exception:
+        return dict(DEFAULT_CHART_MAP)
+
+    C_CHART_TAG = f"{{{C_NS}}}chart"
+
+    # Collect (H_norm, V_off, part) for every pie chart
+    chart_positions: List[tuple] = []
+    seen: set = set()
+
+    for chart_ref in doc_root.iter(C_CHART_TAG):
+        rid = chart_ref.get(f"{{{R_NS}}}id")
+        if not rid or rid not in rid_to_part:
+            continue
+        part = rid_to_part[rid]
+        if part in seen or part not in contents:
+            continue
+        try:
+            chart_root = etree.fromstring(contents[part])
+        except Exception:
+            continue
+        if not chart_root.findall(f".//{{{C_NS}}}pieChart"):
+            continue
+        seen.add(part)
+
+        # Walk up to find the wp:anchor (floating) or wp:inline element
+        anchor = None
+        parent = chart_ref.getparent()
+        while parent is not None:
+            if parent.tag == f"{{{WP_NS}}}anchor":
+                anchor = parent
+                break
+            if parent.tag == f"{{{WP_NS}}}inline":
+                break
+            parent = parent.getparent()
+
+        H_norm = 0
+        V_off = 0
+        if anchor is not None:
+            posH = anchor.find(f"{{{WP_NS}}}positionH")
+            posV = anchor.find(f"{{{WP_NS}}}positionV")
+            if posH is not None:
+                h_offset = posH.find(f"{{{WP_NS}}}posOffset")
+                h_align = posH.find(f"{{{WP_NS}}}align")
+                if h_offset is not None and h_offset.text:
+                    try:
+                        H_norm = int(h_offset.text)
+                    except ValueError:
+                        pass
+                elif h_align is not None:
+                    # 'left' → 0, 'center' → middle of page, 'right' → far right
+                    align = (h_align.text or "").lower()
+                    H_norm = 0 if align == "left" else (3000000 if align == "center" else 6000000)
+            if posV is not None:
+                v_offset = posV.find(f"{{{WP_NS}}}posOffset")
+                if v_offset is not None and v_offset.text:
+                    try:
+                        V_off = int(v_offset.text)
+                    except ValueError:
+                        pass
+
+        chart_positions.append((H_norm, V_off, part))
+
+    if len(chart_positions) < 3:
+        return dict(DEFAULT_CHART_MAP)
+
+    # Sort by H to find the full horizontal range
+    chart_positions.sort(key=lambda x: x[0])
+    min_H = chart_positions[0][0]
+    max_H = chart_positions[-1][0]
+
+    if max_H == min_H:
+        # All at same H (e.g. vertical layout) — fall back
+        return dict(DEFAULT_CHART_MAP)
+
+    # Divide H range into 3 equal buckets → left / middle / right
+    bucket_size = (max_H - min_H) / 3.0
+    buckets: List[List[tuple]] = [[], [], []]
+    for H, V, part in chart_positions:
+        idx = min(2, int((H - min_H) / bucket_size))
+        buckets[idx].append((H, V, part))
+
+    # Map ALL charts in each H bucket to the corresponding family.
+    # Both the primary (visible) and secondary (duplicate) chart in a bucket
+    # get the same data, so whichever one is visible in the memo is correct.
+    result: Dict[str, str] = {}
+    for i, bucket in enumerate(buckets):
+        if not bucket:
+            return dict(DEFAULT_CHART_MAP)
+        for _, _, part in bucket:
+            result[part] = FAMILY_ORDER[i]
+
+    return result
+
+
 def update_native_pies(docx_path, blend_categories: Dict[str, Sequence[Dict[str, Any]]],
-                       chart_map: Dict[str, str] = DEFAULT_CHART_MAP,
+                       chart_map: Dict[str, str] = None,
                        label_fmt: Callable[[str, float], str] = _default_label,
                        label_colors: Dict[str, str] = None) -> Dict[str, List[str]]:
     docx_path = Path(docx_path)
     with zipfile.ZipFile(docx_path, "r") as zin:
         names = zin.namelist()
         contents = {name: zin.read(name) for name in names}
+
+    # Discover which chart XML file corresponds to which exposure family from
+    # the document itself, rather than relying on hardcoded chart1/2/3 positions.
+    if chart_map is None:
+        chart_map = _build_chart_map_from_document(contents)
 
     report: Dict[str, List[str]] = {}
     for part, family in chart_map.items():

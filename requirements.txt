@@ -3,3 +3,4 @@ openpyxl>=3.1
 python-docx>=1.1
 lxml>=5.0
 legacy-cgi>=2.6 ; python_version >= "3.13"
+pymupdf>=1.24
