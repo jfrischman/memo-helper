@@ -959,39 +959,79 @@ def _replace_cashflow_image(memo_path: Path, cf_data: dict) -> None:
     if not cf_data.get("rows"):
         return
 
-    # Search for the image using both encodings:
-    #   - UTF-16-LE: original EMF files embed text this way
-    #   - ASCII:     PNG files we render include "Combined Cashflows" in PNG metadata (Title tag)
-    needle_utf16 = "Combined Cashflows".encode("utf-16-le")
-    needle_ascii = b"Combined Cashflows"
-
-    # Read all zip entries
+    # Read all zip entries up front (needed by all search paths)
     with zipfile.ZipFile(str(memo_path), "r") as zin:
         all_files = {n: zin.read(n) for n in zin.namelist()}
 
-    # Find the media file whose binary contains either marker
+    rels_content = all_files.get("word/_rels/document.xml.rels", b"").decode("utf-8")
+    rels_root = _et.fromstring(rels_content.encode("utf-8"))
+
+    WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    A  = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    R  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
     emf_name: Optional[str] = None
+    rid: Optional[str] = None
+
+    # Stage 1 & 2: search media binary for text markers
+    #   UTF-16-LE = original EMF;  ASCII = PNG we rendered (has Title metadata)
+    needle_utf16 = "Combined Cashflows".encode("utf-16-le")
+    needle_ascii = b"Combined Cashflows"
     for name, data in all_files.items():
         if name.startswith("word/media/") and (needle_utf16 in data or needle_ascii in data):
             emf_name = name
             break
-    if not emf_name:
-        raise ValueError("Could not find 'Combined Cashflows' image in the memo.")
 
-    # Find the relationship Id for this media file in document.xml.rels
-    rels_content = all_files.get("word/_rels/document.xml.rels", b"").decode("utf-8")
-    short_target = emf_name.replace("word/", "")   # e.g. "media/image2.emf"
-    filename_only = emf_name.split("/")[-1]          # e.g. "image2.emf"
+    if emf_name:
+        short_target  = emf_name.replace("word/", "")
+        filename_only = emf_name.split("/")[-1]
+        for rel in rels_root:
+            t = rel.get("Target", "")
+            if t == short_target or t.endswith("/" + filename_only):
+                rid = rel.get("Id")
+                break
 
-    rels_root = _et.fromstring(rels_content.encode("utf-8"))
-    rid: Optional[str] = None
-    for rel in rels_root:
-        t = rel.get("Target", "")
-        if t == short_target or t.endswith("/" + filename_only):
-            rid = rel.get("Id")
-            break
+    # Stage 3: dimension-based fallback — find floating anchor with cx ≈ 3.67"
+    # Handles manually-inserted images and pre-marker PNGs from earlier runs.
     if not rid:
-        raise ValueError(f"Could not find relationship for {emf_name}")
+        TARGET_CX    = 3355258  # 3.67 inches in EMU
+        CX_TOLERANCE = 65000   # ±0.071 inch
+        doc_root_s = _et.fromstring(all_files.get("word/document.xml", b""))
+        best_diff: int = CX_TOLERANCE + 1
+        best_rid:  Optional[str] = None
+        for anchor in doc_root_s.iter(f"{{{WP}}}anchor"):
+            ext_el = anchor.find(f"{{{WP}}}extent")
+            if ext_el is None:
+                continue
+            try:
+                cx = int(ext_el.get("cx", "0"))
+            except (ValueError, TypeError):
+                continue
+            diff = abs(cx - TARGET_CX)
+            if diff < best_diff:
+                for b in anchor.findall(f".//{{{A}}}blip"):
+                    r = b.get(f"{{{R}}}embed")
+                    if r:
+                        best_rid  = r
+                        best_diff = diff
+                        break
+        if best_rid:
+            rid = best_rid
+            for rel in rels_root:
+                if rel.get("Id") == rid:
+                    t = rel.get("Target", "")
+                    if t:
+                        emf_name = "word/" + t
+                    break
+
+    if not rid or not emf_name:
+        raise ValueError(
+            "Could not find 'Combined Cashflows' image in the memo. "
+            "Make sure the memo contains the original cashflow image or a previous replacement."
+        )
+
+    # Derive short_target from whichever search path found emf_name
+    short_target = emf_name.replace("word/", "")   # e.g. "media/image2.emf"
 
     # Render the new PNG
     png_bytes = _render_cashflow_table_image(cf_data)
@@ -1013,10 +1053,6 @@ def _replace_cashflow_image(memo_path: Path, cf_data: dict) -> None:
     # Update document.xml — find the anchor that embeds this rId and update extent values
     doc_xml = all_files.get("word/document.xml", b"")
     doc_root = _et.fromstring(doc_xml)
-    WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-    A  = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    R  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-
     updated_anchor = False
     for anchor in doc_root.iter(f"{{{WP}}}anchor"):
         blips = anchor.findall(f".//{{{A}}}blip")
