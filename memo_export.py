@@ -1161,6 +1161,10 @@ def _apply_model_outputs(doc: Document, result: Dict[str, Any]) -> None:
     elif mgr_irr is not None:
         set_next("Upside / Downside", fmt_pct(mgr_irr))
 
+    wal = model.get("base_wal")
+    if wal is not None:
+        set_next("WAL (yrs)", f"{float(wal):.1f}")
+
 
 def _fmt_irr(v: Optional[float]) -> str:
     if v is None:

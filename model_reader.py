@@ -107,7 +107,7 @@ def read_model_outputs(path: str) -> dict:
             if case and case not in case_sec_col:
                 case_sec_col[case] = sc
 
-        irr_row = moic_row = None
+        irr_row = moic_row = dur_row = None
         for r in range(sec_row + 1, sec_row + 15):
             for c in range(1, 6):
                 v = cells.get((r, c))
@@ -117,6 +117,8 @@ def read_model_outputs(path: str) -> dict:
                         irr_row = r
                     elif u == "NET MOIC" and moic_row is None:
                         moic_row = r
+                    elif "DURATION" in u and dur_row is None:
+                        dur_row = r
 
         if irr_row:
             for case, col in case_sec_col.items():
@@ -128,6 +130,11 @@ def read_model_outputs(path: str) -> dict:
                 v = cells.get((moic_row, col))
                 if isinstance(v, (int, float)):
                     result[f"{case}_moic"] = float(v)
+        if dur_row and "base" in case_sec_col:
+            # WAL is treated as the combined Base Case Secondary duration.
+            v = cells.get((dur_row, case_sec_col["base"]))
+            if isinstance(v, (int, float)):
+                result["base_wal"] = float(v)
 
     else:
         # Fallback: no Sec sub-headers — read directly from case header columns
