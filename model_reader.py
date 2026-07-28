@@ -325,3 +325,145 @@ def read_cashflows(path: str) -> dict:
             cf_rows.append(entry)
 
     return {"header": h, "rows": cf_rows}
+
+
+def read_fund_returns(path: str) -> list:
+    """
+    Extract Base/Bear/Manager Net IRR + Net MOIC (Secondary and Fund columns)
+    for the combined position and every fund block on the Model tab, in the
+    same left-to-right order as the sheet's Include?/fund-name rows.
+
+    Handles any number of fund blocks (not hardcoded to a fixed count) by
+    locating blocks from the repeating BASE/BEAR/MANAGER CASE headers rather
+    than fixed columns.
+
+    Returns an ordered list, combined entry first:
+      [{"name": None, "included": True, "base_irr_sec": .., "base_irr_fund": ..,
+        "bear_irr_sec": .., "bear_irr_fund": .., "mgr_irr_sec": .., "mgr_irr_fund": ..,
+        "base_moic_sec": .., ... (same pattern)}, ...]
+    "name" is None for the combined entry (caller fills in the project name).
+    Funds with Include? == 0 are still returned, with included=False, so the
+    caller decides whether to render them.
+    """
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to read Excel models.")
+
+    tmp = Path(tempfile.mktemp(suffix=".xlsx"))
+    shutil.copy2(path, str(tmp))
+    try:
+        wb, ws = _load_ws(str(tmp))
+        cells = {}
+        try:
+            for row in ws.iter_rows():
+                for cell in row:
+                    cells[(cell.row, cell.column)] = cell.value
+        finally:
+            wb.close()
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # --- Fund order + Include? flags (row with "Include?" label, names one row below) ---
+    include_row: Optional[int] = None
+    for (r, c), v in cells.items():
+        if isinstance(v, str) and v.strip().rstrip("?").strip().upper() == "INCLUDE":
+            include_row = r
+            break
+
+    fund_list: list = []  # [(name, included), ...] left-to-right, combined excluded
+    if include_row is not None:
+        name_row = include_row + 1
+        name_cols = sorted(
+            c for (r, c), v in cells.items()
+            if r == name_row and isinstance(v, str) and v.strip()
+        )
+        if len(name_cols) > 1:
+            for c in name_cols[1:]:  # first col is the combined label, skip
+                name = str(cells[(name_row, c)]).strip()
+                flag = cells.get((include_row, c))
+                fund_list.append((name, bool(flag)))
+
+    # --- Locate Base/Bear/Mgr x Sec/Fund column blocks (repeating across the sheet) ---
+    sec_by_row: dict = {}
+    for (r, c), v in cells.items():
+        if isinstance(v, str) and v.strip() == "Sec":
+            sec_by_row.setdefault(r, []).append(c)
+    if not sec_by_row:
+        return []
+    sec_row = max(sec_by_row, key=lambda r: len(sec_by_row[r]))
+    case_row = sec_row - 1
+
+    def case_at(col: int) -> Optional[str]:
+        for c in range(col, max(1, col - 10) - 1, -1):
+            v = cells.get((case_row, c))
+            if isinstance(v, str):
+                u = v.strip().upper()
+                if "BASE" in u:
+                    return "base"
+                if "BEAR" in u:
+                    return "bear"
+                if "MANAGER" in u or "MGR" in u or "UPSIDE" in u:
+                    return "mgr"
+        return None
+
+    def fund_col_after(sec_col: int) -> Optional[int]:
+        for offset in range(1, 4):
+            v = cells.get((sec_row, sec_col + offset))
+            if isinstance(v, str) and v.strip() == "Fund":
+                return sec_col + offset
+        return None
+
+    # A new block starts whenever a case repeats (works for any number of blocks).
+    blocks: list = []
+    current: dict = {}
+    for sc in sorted(sec_by_row[sec_row]):
+        case = case_at(sc)
+        if not case:
+            continue
+        if case in current:
+            blocks.append(current)
+            current = {}
+        current[case] = (sc, fund_col_after(sc))
+    if current:
+        blocks.append(current)
+    if not blocks:
+        return []
+
+    # --- Net IRR / Net MOIC rows (shared across all blocks) ---
+    irr_row = moic_row = None
+    for r in range(sec_row + 1, sec_row + 15):
+        for c in range(1, 60):
+            v = cells.get((r, c))
+            if isinstance(v, str):
+                u = v.strip().upper()
+                if u == "NET IRR" and irr_row is None:
+                    irr_row = r
+                elif u == "NET MOIC" and moic_row is None:
+                    moic_row = r
+        if irr_row and moic_row:
+            break
+
+    def metrics_for(block: dict) -> dict:
+        out = {}
+        for case, (sc, fc) in block.items():
+            if irr_row is not None:
+                v = cells.get((irr_row, sc))
+                out[f"{case}_irr_sec"] = float(v) if isinstance(v, (int, float)) else None
+                if fc is not None:
+                    v = cells.get((irr_row, fc))
+                    out[f"{case}_irr_fund"] = float(v) if isinstance(v, (int, float)) else None
+            if moic_row is not None:
+                v = cells.get((moic_row, sc))
+                out[f"{case}_moic_sec"] = float(v) if isinstance(v, (int, float)) else None
+                if fc is not None:
+                    v = cells.get((moic_row, fc))
+                    out[f"{case}_moic_fund"] = float(v) if isinstance(v, (int, float)) else None
+        return out
+
+    result: list = [{"name": None, "included": True, **metrics_for(blocks[0])}]
+    for (name, included), block in zip(fund_list, blocks[1:]):
+        result.append({"name": name, "included": included, **metrics_for(block)})
+
+    return result

@@ -2970,10 +2970,16 @@ class Handler(BaseHTTPRequestHandler):
                 cashflows = model_reader.read_cashflows(xlsx_path)
             except Exception:
                 pass  # cashflow image update is non-fatal
+            fund_returns = []
+            try:
+                fund_returns = model_reader.read_fund_returns(xlsx_path)
+            except Exception:
+                pass  # Underwritten IRR/MOIC table update is non-fatal
             update_sections_in_file(
                 memo_path,
-                {"_model_outputs": model_outputs, "_cashflows": cashflows},
-                sections=("model_outputs",),
+                {"_model_outputs": model_outputs, "_cashflows": cashflows,
+                 "_fund_returns": fund_returns},
+                sections=("model_outputs", "fund_returns"),
                 project=saved,
             )
         except PermissionError:

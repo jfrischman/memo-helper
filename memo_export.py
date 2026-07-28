@@ -1162,11 +1162,87 @@ def _apply_model_outputs(doc: Document, result: Dict[str, Any]) -> None:
         set_next("Upside / Downside", fmt_pct(mgr_irr))
 
 
+def _fmt_irr(v: Optional[float]) -> str:
+    if v is None:
+        return ""
+    pct = v * 100
+    return f"({abs(pct):.1f}%)" if pct < 0 else f"{pct:.1f}%"
+
+
+def _fmt_moic_val(v: Optional[float]) -> str:
+    return f"{v:.2f}x" if v is not None else ""
+
+
+def _fmt_return_pair(irr: Optional[float], moic: Optional[float]) -> str:
+    irr_s, moic_s = _fmt_irr(irr), _fmt_moic_val(moic)
+    if not irr_s and not moic_s:
+        return ""
+    return f"{irr_s} / {moic_s}"
+
+
+def _find_returns_table(doc: Document):
+    """Locate the Underwritten IRR / MOIC table by its Secondary/Fund sub-header
+    row rather than the title text (which is misspelled 'Unerwritten' in some
+    memo templates)."""
+    for t in doc.tables:
+        if len(t.rows) < 2 or len(t.columns) != 7:
+            continue
+        sub = [c.text.strip().upper() for c in t.rows[1].cells[1:]]
+        if sub == ["SECONDARY", "FUND"] * 3:
+            return t
+    return None
+
+
+def _apply_fund_returns_table(doc: Document, result: Dict[str, Any]) -> None:
+    """Rebuild the Underwritten IRR / MOIC table: combined row first, then one
+    row per included fund in the model's left-to-right order. Row count is
+    synced to however many entries are included, so this works for any number
+    of funds. Values come from result['_fund_returns'] (model_reader.read_fund_returns)."""
+    entries = result.get("_fund_returns") or []
+    if not entries:
+        return
+    table = _find_returns_table(doc)
+    if table is None:
+        return
+
+    rows_data = [dict(entries[0], name=result.get("_project_name") or "Combined")]
+    rows_data += [e for e in entries[1:] if e.get("included")]
+
+    import copy
+    tbl = table._tbl
+    header_count = 2
+    data_trs = list(tbl.tr_lst)[header_count:]
+    # Clone the last data row (not a header row) — the header rows have
+    # merged/shaded cells that don't match a plain data row's structure.
+    proto_tr = data_trs[-1] if data_trs else list(tbl.tr_lst)[-1]
+
+    for tr in data_trs[len(rows_data):]:
+        tbl.remove(tr)
+    for _ in range(len(rows_data) - len(data_trs)):
+        tbl.append(copy.deepcopy(proto_tr))
+
+    for ri, entry in enumerate(rows_data):
+        row = table.rows[header_count + ri]
+        _set_cell_text(row.cells[0], entry.get("name") or "",
+                       align=WD_ALIGN_PARAGRAPH.LEFT, font_pt=9)
+        pairs = [
+            _fmt_return_pair(entry.get("base_irr_sec"),  entry.get("base_moic_sec")),
+            _fmt_return_pair(entry.get("base_irr_fund"), entry.get("base_moic_fund")),
+            _fmt_return_pair(entry.get("bear_irr_sec"),  entry.get("bear_moic_sec")),
+            _fmt_return_pair(entry.get("bear_irr_fund"), entry.get("bear_moic_fund")),
+            _fmt_return_pair(entry.get("mgr_irr_sec"),   entry.get("mgr_moic_sec")),
+            _fmt_return_pair(entry.get("mgr_irr_fund"),  entry.get("mgr_moic_fund")),
+        ]
+        for ci, val in enumerate(pairs):
+            _set_cell_text(row.cells[ci + 1], val, align=WD_ALIGN_PARAGRAPH.CENTER, font_pt=9)
+
+
 SECTION_UPDATERS = {
     "exposures": (_apply_exposure_tables, True),
     "portfolio_names": (_apply_portfolio_names, False),
     "fund_info": (_update_fund_summary_table, False),
     "model_outputs": (_apply_model_outputs, False),
+    "fund_returns": (_apply_fund_returns_table, False),
 }
 
 
