@@ -483,7 +483,7 @@ def expand_paths(paths: List[str], extensions: tuple = (".pdf",),
     Searches recursively through all subdirectories."""
     result = []
     for p in paths:
-        path = Path(p)
+        path = Path(p.strip().strip('"').strip("'"))
         if path.is_file() and path.suffix.lower() in extensions:
             result.append(str(path))
         elif path.is_dir():

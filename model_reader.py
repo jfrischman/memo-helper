@@ -117,7 +117,7 @@ def read_model_outputs(path: str) -> dict:
                         irr_row = r
                     elif u == "NET MOIC" and moic_row is None:
                         moic_row = r
-                    elif "DURATION" in u and dur_row is None:
+                    elif ("DURATION" in u or "WAL" in u) and dur_row is None:
                         dur_row = r
 
         if irr_row:
@@ -307,7 +307,7 @@ def read_cashflows(path: str) -> dict:
                 "mgr_moic_sec":   _fv(cells.get((r, mgr_s))),
                 "mgr_moic_fund":  _fv(cells.get((r, mgr_f))),
             })
-        elif "DURATION" in lu:
+        elif "DURATION" in lu or "WAL" in lu:
             h.update({
                 "base_dur_sec":  _fv(cells.get((r, base_s))),
                 "base_dur_fund": _fv(cells.get((r, base_f))),
@@ -474,3 +474,162 @@ def read_fund_returns(path: str) -> list:
         result.append({"name": name, "included": included, **metrics_for(block)})
 
     return result
+
+
+# Fixed row order of the Effective Bid Price bridge block, starting at the
+# "Effective Bid Price" anchor row.
+_BID_BRIDGE_ROW_KEYS = [
+    "eff_bid", "gross_bid", "rd_nav", "sec_px", "eff_bid_nof",
+    "known_dist", "known_contrib", "rd_nav_nof", "sec_px_nof",
+    "eff_bid_nofp", "mtm_since_rd", "rd_nav_nofp", "sec_px_nofp",
+]
+
+
+def read_bid_bridge(path: str) -> list:
+    """
+    Read the Effective Bid Price bridge block from the Model sheet:
+    Effective Bid Price, Gross Bid Price, RD NAV, Sec. Px Price, Eff. Bid
+    Price Net of Flows, Known Dist / Known Contribs btwn RD and TD, RD NAV /
+    Sec. Px net of flows, Eff. Bid Price Net of Flows + PNL, MTM Since RD,
+    RD NAV / Sec. Px net of Flows + PNL — 13 rows in fixed order.
+
+    Layout, located relative to the "Effective Bid Price" label cell (anchor):
+      anchor_row - 2: "Include?"   0/1 flag per fund column
+      anchor_row - 1: fund names, one per fund column
+      anchor_row:     "Effective Bid Price" (label col; combined value is the
+                      next column to the right, fund values follow after that)
+      anchor_row .. anchor_row+12: the 13 metrics, one row each
+
+    Returns an ordered list, combined entry first:
+      [{"name": None, "included": True, "eff_bid": .., "gross_bid": .., ...}, ...]
+    "name" holds the model's own column header text (row anchor_row-1), so the
+    caller can use it to (re)label the memo table's header cells. Funds with
+    Include? == 0 are still returned, with included=False, so the caller
+    decides whether to render them.
+    """
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to read Excel models.")
+
+    tmp = Path(tempfile.mktemp(suffix=".xlsx"))
+    shutil.copy2(path, str(tmp))
+    try:
+        wb, ws = _load_ws(str(tmp))
+        cells = {}
+        try:
+            for row in ws.iter_rows():
+                for cell in row:
+                    cells[(cell.row, cell.column)] = cell.value
+        finally:
+            wb.close()
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    anchor_row: Optional[int] = None
+    anchor_col: Optional[int] = None
+    for (r, c), v in cells.items():
+        if isinstance(v, str) and v.strip().lower() == "effective bid price":
+            anchor_row, anchor_col = r, c
+            break
+    if anchor_row is None or anchor_col is None:
+        return []
+
+    name_row = anchor_row - 1
+    include_row = anchor_row - 2
+    combined_col = anchor_col + 1
+
+    fund_cols = []
+    c = combined_col + 1
+    while isinstance(cells.get((name_row, c)), str) and cells[(name_row, c)].strip():
+        fund_cols.append(c)
+        c += 1
+
+    def col_values(col: int) -> list:
+        vals = []
+        for r in range(anchor_row, anchor_row + len(_BID_BRIDGE_ROW_KEYS)):
+            v = cells.get((r, col))
+            vals.append(float(v) if isinstance(v, (int, float)) else None)
+        return vals
+
+    combined_name = str(cells.get((name_row, combined_col)) or "").strip()
+    result: list = [dict(zip(_BID_BRIDGE_ROW_KEYS, col_values(combined_col)),
+                          name=combined_name or None, included=True)]
+    for c in fund_cols:
+        name = str(cells.get((name_row, c)) or "").strip()
+        flag = cells.get((include_row, c))
+        included = flag == 1 or flag is True
+        result.append(dict(zip(_BID_BRIDGE_ROW_KEYS, col_values(c)),
+                            name=name, included=included))
+    return result
+
+
+def read_cash_flow_profile(path: str) -> dict:
+    """
+    Read the Cash Flow Profile chart source table from the 'Memo' sheet.
+
+    This table (dates + a 'Return of Capital' column + a 'MOIC' column) is
+    formula-driven off the Model sheet's Base Case Combined Cashflows and the
+    model's own computed Net MOIC, so it is read as-is rather than recomputed.
+
+    Located by finding the 'Return of Capital' column header; the date column
+    sits one column to its left, the MOIC column one column to its right.
+
+    Returns {"rows": [{"date": datetime|None, "roc": float|None,
+                       "moic": float|None}, ...]}
+    Trailing rows with no MOIC value (the line series ran out) are dropped.
+    """
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to read Excel models.")
+
+    from datetime import datetime as _dt
+
+    tmp = Path(tempfile.mktemp(suffix=".xlsx"))
+    shutil.copy2(path, str(tmp))
+    try:
+        wb = openpyxl.load_workbook(str(tmp), data_only=True)
+        if "Memo" not in wb.sheetnames:
+            return {"rows": []}
+        ws = wb["Memo"]
+        cells = {}
+        for row in ws.iter_rows():
+            for cell in row:
+                cells[(cell.row, cell.column)] = cell.value
+        wb.close()
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    label_row = label_col = None
+    for (r, c), v in cells.items():
+        if isinstance(v, str) and "return of capital" in v.strip().lower():
+            label_row, label_col = r, c
+            break
+    if label_row is None:
+        return {"rows": []}
+
+    date_col = label_col - 1
+    moic_col = label_col + 1
+
+    rows = []
+    r = label_row + 1
+    while True:
+        d = cells.get((r, date_col))
+        roc = cells.get((r, label_col))
+        moic = cells.get((r, moic_col))
+        if roc is None and moic is None:
+            break
+        rows.append({
+            "date": d if isinstance(d, _dt) else None,
+            "roc": float(roc) if isinstance(roc, (int, float)) else None,
+            "moic": float(moic) if isinstance(moic, (int, float)) else None,
+        })
+        r += 1
+
+    while rows and rows[-1]["moic"] is None:
+        rows.pop()
+
+    return {"rows": rows}

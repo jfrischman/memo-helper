@@ -144,6 +144,76 @@ HTML = r"""<!DOCTYPE html>
     .btn.secondary {
       background: #f7f3ee;
     }
+    .guide-btn {
+      appearance: none;
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 14px;
+      font: inherit;
+      font-size: 12.5px;
+      color: var(--accent);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .guide-btn:hover { background: #eef5f8; }
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(31,41,55,.45);
+      z-index: 50;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal-box {
+      background: var(--panel);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      max-width: 800px;
+      width: 100%;
+      max-height: 86vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .modal-head {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .modal-head h2 { margin: 0; font-size: 16px; }
+    .modal-close {
+      appearance: none;
+      border: none;
+      background: none;
+      font-size: 22px;
+      line-height: 1;
+      cursor: pointer;
+      color: var(--muted);
+      padding: 2px 6px;
+    }
+    .modal-close:hover { color: var(--text); }
+    .modal-body {
+      padding: 8px 20px 22px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .modal-body h3 { font-size: 14px; margin: 18px 0 6px; color: var(--accent); }
+    .modal-body h3:first-child { margin-top: 12px; }
+    .modal-body table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; font-size: 12.5px; }
+    .modal-body th, .modal-body td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+    .modal-body th { background: var(--panel-2); }
+    .modal-body ul { margin: 4px 0 10px 18px; padding: 0; }
+    .modal-body li { margin-bottom: 4px; }
+    .modal-body p { margin: 6px 0; }
+    .modal-body hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
     .field {
       display: grid;
       gap: 6px;
@@ -414,11 +484,111 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <header>
-    <h1>Memo Helper</h1>
+    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+      <h1>Memo Helper</h1>
+      <button class="guide-btn" id="guideBtn" type="button">Update Buttons Guide</button>
+    </div>
     <div class="sub">
       Start a project, attach it to a memo, upload one workbook per fund, and save the project so the inputs stay with the memo.
     </div>
   </header>
+  <div class="modal-overlay" id="guideOverlay">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2>Update Buttons Guide</h2>
+        <button class="modal-close" id="guideCloseBtn" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p><strong>Does this button touch the memo file?</strong></p>
+        <table>
+          <tr><th>Button</th><th>Writes to the memo .docx?</th></tr>
+          <tr><td>Calculate exposures</td><td>No &mdash; browser preview only</td></tr>
+          <tr><td><strong>Update Exposures</strong></td><td><strong>Yes</strong>, overwrites the file at Memo file path</td></tr>
+          <tr><td><strong>Update Fund Information</strong></td><td><strong>Yes</strong>, overwrites the file at Memo file path</td></tr>
+          <tr><td><strong>Update Model Outputs</strong></td><td><strong>Yes</strong>, overwrites the file at Memo file path</td></tr>
+          <tr><td><strong>Update All</strong></td><td><strong>Yes</strong> &mdash; runs Update Exposures + Update Fund Information only</td></tr>
+          <tr><td>Export memo</td><td>No &mdash; writes a brand-new copy to <code>exports/</code>, never touches the live memo</td></tr>
+          <tr><td>Save project</td><td>No &mdash; just saves your inputs to the project file</td></tr>
+          <tr><td>Download JSON / Download positions Excel</td><td>No &mdash; standalone file download</td></tr>
+          <tr><td>Parse project files / per-fund Parse</td><td>No &mdash; only fills in the Fund Information table in the browser</td></tr>
+        </table>
+        <p>The memo must be <strong>closed in Word</strong> before pressing any of the three bolded Update buttons &mdash; if Word has it open, you'll get an error telling you to close it and retry.</p>
+        <hr />
+
+        <h3>Update Exposures</h3>
+        <p><strong>What it changes in the memo:</strong></p>
+        <ul>
+          <li>Investment Summary box: Top 1 / Top 5 position %, Positions &gt; 20%, Underlying Funds, Underlying Investments</li>
+          <li>Top Positions / concentration table</li>
+          <li>Asset Type By Fund table</li>
+          <li>Current Portfolio bullet list (names + weight %)</li>
+          <li>The three exposure pie charts: security type, asset class, geography</li>
+        </ul>
+        <p><strong>Where the data comes from:</strong></p>
+        <ul>
+          <li>Each fund's uploaded workbook, using the columns you mapped (asset class, security type, geography) and the record-date NAV column for within-fund weighting (cash-like rows like money market/T-bills excluded)</li>
+          <li>Funds with no workbook use whatever manual category mix you typed in instead</li>
+          <li>Across funds, each fund's contribution is weighted by the <strong>bid amount</strong> you entered for it, not by NAV</li>
+          <li>Any normalization rules / issuer aliases / force-split text you've entered</li>
+        </ul>
+        <p><strong>Needs in place first:</strong> an open project, a Memo file path pointing to an existing .docx, and at least one fund with either an uploaded+mapped workbook or a manual mix, plus a positive bid amount.</p>
+        <p><strong>Does NOT touch:</strong> the Fund Summary table, model outputs, IRR/MOIC, bid bridge, or cash-flow chart.</p>
+        <hr />
+
+        <h3>Update Fund Information</h3>
+        <p><strong>What it changes in the memo:</strong></p>
+        <ul>
+          <li>The Fund Summary table (Fund / LP NAV / Unfunded / Commits / Invest End / Term End / Extensions / IRR / TVPI / RVPI / DPI / Leverage)</li>
+          <li>Adds a perpetuity footnote if any fund is flagged as perpetual</li>
+        </ul>
+        <p><strong>Where the data comes from:</strong></p>
+        <ul>
+          <li>The Fund Information panel's per-field values &mdash; each field is either parsed by GPT-4o from documents you uploaded (quarterly letters, audited financials, capital account statements, LPAs) via the Parse buttons, or typed/overridden manually and locked</li>
+          <li>Manual overrides always win over a parsed value</li>
+        </ul>
+        <p><strong>Needs in place first:</strong> Memo file path set; fund info fields populated (via parsing or manual entry) &mdash; otherwise the table just gets resized to match your fund count with mostly blank cells.</p>
+        <p><strong>Does NOT touch:</strong> exposure tables, pie charts, or model outputs.</p>
+        <hr />
+
+        <h3>Update Model Outputs</h3>
+        <p><strong>What it changes in the memo:</strong></p>
+        <ul>
+          <li>Investment Summary box: Bid Price, Effective Price, Base IRR/MOIC, Upside/Downside, WAL</li>
+          <li>The header text ("Base Case Expected Net Return: X% / Y.YYx")</li>
+          <li>Underwritten IRR/MOIC table</li>
+          <li>Effective Bid Price bridge table</li>
+          <li>The Combined Cashflows image (replaced with a freshly rendered image)</li>
+          <li>The Cash Flow Profile chart (Return of Capital bars + MOIC line)</li>
+        </ul>
+        <p><strong>Where the data comes from:</strong></p>
+        <ul>
+          <li>A single Excel <strong>combined model</strong> file (separate field from the fund workbooks &mdash; set via Browse next to Model file) &mdash; not the fund workbooks and not the bid amounts entered elsewhere in the app</li>
+          <li>Each sub-section (fund returns, bid bridge, cash-flow profile) is read independently and silently skipped if not found in that workbook; only the core Bid Price/IRR/MOIC/WAL read is required and will hard-fail the whole update if missing</li>
+        </ul>
+        <p><strong>Needs in place first:</strong> Memo file path set, and the Excel model file path set to an existing file.</p>
+        <p><strong>Does NOT touch:</strong> exposure tables, pie charts, or the Fund Summary table. This button is fully independent of the fund workbooks and bid amounts.</p>
+        <hr />
+
+        <h3>Update All</h3>
+        <p>Runs <strong>Update Exposures</strong> then <strong>Update Fund Information</strong>, back to back.</p>
+        <p><strong>Important:</strong> this does not include Update Model Outputs. If you need the IRR/MOIC table, bid bridge, or cash-flow chart refreshed, click Update Model Outputs separately.</p>
+        <hr />
+
+        <h3>Export memo</h3>
+        <p>Produces a <strong>new, separate file</strong> (downloaded, and saved under the project's exports/ folder) &mdash; it never modifies the live memo.</p>
+        <p><strong>What it includes:</strong> the same exposure tables, portfolio names, and pie charts as Update Exposures. It does not include Fund Information or Model Outputs sections.</p>
+        <p><strong>What it's built from:</strong> if the Memo file path is set and that file exists, it's used as the starting template (so anything already in that file carries over). If no Memo file path is set, it silently falls back to a hardcoded default template on this machine &mdash; only correct for the "Project Balance" project, so always set the Memo file path for any other project before exporting.</p>
+        <hr />
+
+        <h3>Calculate exposures</h3>
+        <p>Browser-only preview &mdash; recomputes the same blend as Update Exposures and renders it as charts/tables/summary in the app, but writes nothing to disk. Use this to sanity-check numbers before committing to Update Exposures. Also runs automatically as you edit funds/bids if "Live chart updates" is checked.</p>
+        <hr />
+
+        <h3>Save project</h3>
+        <p>Saves your current inputs (fund list, bid amounts, column mappings, memo/model paths, rules, fund info) to the project's own file so you can close and reopen later. Does not touch the memo. Runs automatically in the background a moment after most edits, so you rarely need to click it manually.</p>
+      </div>
+    </div>
+  </div>
   <main>
     <section class="panel">
       <div class="panel-head">
@@ -467,6 +637,10 @@ HTML = r"""<!DOCTYPE html>
             <label for="projectStatus">Status</label>
             <input type="text" id="projectStatus" readonly value="No project loaded" />
           </div>
+          <div class="field">
+            <label for="portfolioCountInput">Current Portfolio positions</label>
+            <input type="number" id="portfolioCountInput" min="1" max="50" value="8" />
+          </div>
         </div>
       </div>
     </section>
@@ -483,6 +657,8 @@ HTML = r"""<!DOCTYPE html>
         <div class="small-note">
           Add a fund, then (optionally) import its holdings workbook within the fund card. A fund without a
           workbook can still contribute via its manual category mix. Imported sheets are expected to have a header row.
+          One Excel with a tab per fund? Import it on the first fund card, then on each other card pick
+          "Use workbook from another fund…" and choose that fund's sheet.
         </div>
         <div id="errorBox" class="error section-gap"></div>
         <div id="fundList" class="grid section-gap"></div>
@@ -595,6 +771,7 @@ HTML = r"""<!DOCTYPE html>
             <span class="fund-import-text">Import Excel</span>
             <input type="file" class="fund-import" accept=".xlsx,.xlsm" style="display:none" />
           </label>
+          <select class="fund-reuse" title="Point this fund at a workbook already imported on another fund card (e.g. one Excel with a tab per fund)."></select>
         </div>
         <div class="mapping-grid">
           <div class="field"><label>Display label</label><input type="text" class="fund-label" /></div>
@@ -684,6 +861,7 @@ HTML = r"""<!DOCTYPE html>
     const browseMemoBtn = document.getElementById('browseMemoBtn');
     const modelXlsxPathInput = document.getElementById('modelXlsxPathInput');
     const browseModelBtn = document.getElementById('browseModelBtn');
+    const portfolioCountInput = document.getElementById('portfolioCountInput');
     const updateExposuresBtn = document.getElementById('updateExposuresBtn');
     const updateModelOutputsBtn = document.getElementById('updateModelOutputsBtn');
     const updateFundInfoBtn = document.getElementById('updateFundInfoBtn');
@@ -697,6 +875,20 @@ HTML = r"""<!DOCTYPE html>
     const parseProjFilesBtn = document.getElementById('parseProjFilesBtn');
     const fundInfoParseStatus = document.getElementById('fundInfoParseStatus');
     const fundInfoParseMsg = document.getElementById('fundInfoParseMsg');
+
+    const guideBtn = document.getElementById('guideBtn');
+    const guideOverlay = document.getElementById('guideOverlay');
+    const guideCloseBtn = document.getElementById('guideCloseBtn');
+    function openGuide() { guideOverlay.classList.add('open'); }
+    function closeGuide() { guideOverlay.classList.remove('open'); }
+    guideBtn.addEventListener('click', openGuide);
+    guideCloseBtn.addEventListener('click', closeGuide);
+    guideOverlay.addEventListener('click', (event) => {
+      if (event.target === guideOverlay) closeGuide();
+    });
+    window.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && guideOverlay.classList.contains('open')) closeGuide();
+    });
 
     // Merge parsed fields into a fund_info object, never overwriting existing
     // non-null values with null, and never touching the override.
@@ -835,6 +1027,7 @@ HTML = r"""<!DOCTYPE html>
         memo_name: memoNameInput.value.trim() || '',
         memo_file_path: memoPathInput.value.trim(),
         model_xlsx_path: modelXlsxPathInput.value.trim(),
+        portfolio_count: Number(portfolioCountInput.value) || 8,
         rules: rulesBox.value || '',
         issuer_aliases: aliasesBox.value || '',
         label_colors: labelColorsBox.value || '',
@@ -884,6 +1077,7 @@ HTML = r"""<!DOCTYPE html>
       memoNameInput.value = project.memo_name || '';
       memoPathInput.value = project.memo_file_path || '';
       modelXlsxPathInput.value = project.model_xlsx_path || '';
+      portfolioCountInput.value = project.portfolio_count || 8;
       rulesBox.value = project.rules || '';
       aliasesBox.value = project.issuer_aliases || '';
       labelColorsBox.value = project.label_colors || '';
@@ -927,6 +1121,7 @@ HTML = r"""<!DOCTYPE html>
         memoNameInput.value = '';
         memoPathInput.value = '';
         modelXlsxPathInput.value = '';
+        portfolioCountInput.value = 8;
         rulesBox.value = '';
         aliasesBox.value = '';
         labelColorsBox.value = '';
@@ -1303,6 +1498,33 @@ HTML = r"""<!DOCTYPE html>
       scheduleChartRefresh();
     }
 
+    async function reuseFundExcel(fund, sourceUploadId) {
+      showError('');
+      const resp = await fetch('/api/reuse_upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_upload_id: sourceUploadId, project_id: activeProjectId() || '' }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Unable to reuse workbook.');
+      const loaded = data.fund;
+      if (!loaded) throw new Error('No workbook loaded.');
+      // merge the shared workbook into this fund (keep its name/bid/manual mix)
+      fund.upload_id = loaded.upload_id;
+      fund.filename = loaded.filename;
+      fund.sheet_names = loaded.sheet_names;
+      fund.default_sheet = loaded.default_sheet;
+      fund.sheet_name = loaded.default_sheet;
+      fund.header_mode = loaded.header_mode;
+      fund.row_count = loaded.row_count;
+      fund.preview = loaded.preview;
+      fund.mapping = loaded.mapping;
+      renderFunds();
+      appState.result = null;
+      scheduleProjectSave();
+      scheduleChartRefresh();
+    }
+
     async function updateExposures() {
       if (!appState.project) { showError('Start or open a project first.'); return; }
       if (!memoPathInput.value.trim()) { showError('Point to a memo file first (Browse next to "Memo file").'); return; }
@@ -1415,6 +1637,33 @@ HTML = r"""<!DOCTYPE html>
       const importText = node.querySelector('.fund-import-text');
       if (importText) importText.textContent = hasWorkbook ? 'Replace Excel' : 'Import Excel';
 
+      const reuseSelect = node.querySelector('.fund-reuse');
+      if (reuseSelect) {
+        const sources = appState.funds.filter((f) => f !== fund && f.preview && f.filename);
+        if (!sources.length) {
+          reuseSelect.style.display = 'none';
+        } else {
+          const placeholder = document.createElement('option');
+          placeholder.value = '';
+          placeholder.textContent = 'Use workbook from another fund…';
+          reuseSelect.appendChild(placeholder);
+          sources.forEach((f) => {
+            const option = document.createElement('option');
+            option.value = f.upload_id;
+            option.textContent = `${f.fund_name || 'Fund'} — ${f.filename}`;
+            reuseSelect.appendChild(option);
+          });
+          reuseSelect.addEventListener('change', () => {
+            const chosen = reuseSelect.value;
+            if (!chosen) return;
+            reuseFundExcel(fund, chosen).catch((err) => {
+              reuseSelect.value = '';
+              showError(err.message || String(err));
+            });
+          });
+        }
+      }
+
       const removeBtn = node.querySelector('.fund-remove');
       if (removeBtn) removeBtn.addEventListener('click', () => removeFund(fund));
 
@@ -1464,11 +1713,12 @@ HTML = r"""<!DOCTYPE html>
       });
 
       const sheetSelect = node.querySelector('.fund-sheet');
+      const selectedSheet = fund.sheet_name || fund.default_sheet;
       fund.sheet_names.forEach((sheet) => {
         const option = document.createElement('option');
         option.value = sheet;
         option.textContent = sheet;
-        if (sheet === fund.default_sheet) option.selected = true;
+        if (sheet === selectedSheet) option.selected = true;
         sheetSelect.appendChild(option);
       });
       sheetSelect.addEventListener('change', async () => {
@@ -2261,6 +2511,13 @@ HTML = r"""<!DOCTYPE html>
         scheduleProjectSave();
       }
     });
+    portfolioCountInput.addEventListener('input', () => {
+      if (appState.project) {
+        appState.project.portfolio_count = Number(portfolioCountInput.value) || 8;
+        setProjectStatus('Unsaved changes');
+        scheduleProjectSave();
+      }
+    });
     rulesBox.addEventListener('input', () => {
       if (appState.project) {
         setProjectStatus('Unsaved changes');
@@ -2384,6 +2641,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/load_base64":
                 self._handle_load_base64()
+                return
+            if self.path == "/api/reuse_upload":
+                self._handle_reuse_upload()
                 return
             if self.path == "/api/projects/new":
                 self._handle_project_new()
@@ -2545,6 +2805,8 @@ class Handler(BaseHTTPRequestHandler):
             project["memo_file_path"] = payload.get("memo_file_path") or ""
         if payload.get("model_xlsx_path") is not None:
             project["model_xlsx_path"] = payload.get("model_xlsx_path") or ""
+        if payload.get("portfolio_count") is not None:
+            project["portfolio_count"] = payload.get("portfolio_count") or 8
         payload_funds = self._normalize_funds_payload(payload.get("funds"))
         project["funds"] = self._persist_project_funds(project_id, payload_funds, project)
         saved = save_project(project)
@@ -2573,6 +2835,8 @@ class Handler(BaseHTTPRequestHandler):
             project["fund_infos"] = payload.get("fund_infos") or {}
         if payload.get("memo_file_path") is not None:
             project["memo_file_path"] = payload.get("memo_file_path") or ""
+        if payload.get("portfolio_count") is not None:
+            project["portfolio_count"] = payload.get("portfolio_count") or 8
         memo_path = (project.get("memo_file_path") or "").strip().strip('"').strip("'")
         if not memo_path:
             raise ValueError("Point to a memo file first (use Browse next to 'Memo file').")
@@ -2701,6 +2965,42 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
         return loaded
+
+    def _handle_reuse_upload(self):
+        """Point a fund at a workbook already imported on another fund card.
+
+        Clones the in-memory upload record under a fresh upload_id so each fund
+        keeps its own sheet selection, header mode, and column mapping while
+        sharing the same bytes (and stored file on disk) — one Excel with a tab
+        per fund only needs to be imported once."""
+        payload = self._read_json()
+        source_upload_id = payload.get("source_upload_id")
+        project_id = payload.get("project_id") or ""
+        src = UPLOADS.get(source_upload_id)
+        if not src:
+            raise ValueError("That workbook is no longer loaded — re-import it on its fund card first.")
+        upload_id = str(uuid.uuid4())
+        UPLOADS[upload_id] = dict(src)
+        if project_id and not UPLOADS[upload_id].get("project_id"):
+            UPLOADS[upload_id]["project_id"] = project_id
+        preview = infer_sheet_preview(src["data"], src["default_sheet"])
+        self._send_json(200, {
+            "fund": {
+                "upload_id": upload_id,
+                "filename": src["filename"],
+                "sheet_names": src["sheet_names"],
+                "default_sheet": src["default_sheet"],
+                "header_mode": preview["header_mode"],
+                "row_count": preview["row_count"],
+                "preview": {
+                    "columns": preview["columns"],
+                    "sample_rows": preview["sample_rows"],
+                },
+                "mapping": {
+                    **preview["suggested_columns"],
+                },
+            }
+        })
 
     def _persist_project_funds(self, project_id: str, funds: List[Dict[str, Any]], project: Dict[str, Any]):
         saved_funds: List[Dict[str, Any]] = []
@@ -2975,11 +3275,22 @@ class Handler(BaseHTTPRequestHandler):
                 fund_returns = model_reader.read_fund_returns(xlsx_path)
             except Exception:
                 pass  # Underwritten IRR/MOIC table update is non-fatal
+            bid_bridge = []
+            try:
+                bid_bridge = model_reader.read_bid_bridge(xlsx_path)
+            except Exception:
+                pass  # Effective Bid Price bridge table update is non-fatal
+            cash_flow_profile = {}
+            try:
+                cash_flow_profile = model_reader.read_cash_flow_profile(xlsx_path)
+            except Exception:
+                pass  # Cash Flow Profile chart update is non-fatal
             update_sections_in_file(
                 memo_path,
                 {"_model_outputs": model_outputs, "_cashflows": cashflows,
-                 "_fund_returns": fund_returns},
-                sections=("model_outputs", "fund_returns"),
+                 "_fund_returns": fund_returns, "_bid_bridge": bid_bridge,
+                 "_cash_flow_profile": cash_flow_profile},
+                sections=("model_outputs", "fund_returns", "bid_bridge", "cash_flow_profile"),
                 project=saved,
             )
         except PermissionError:

@@ -29,12 +29,19 @@ DEFAULT_FIELD_SYNONYMS: Dict[str, List[str]] = {
         "fund nav",
         "record date nav ($m)",
         "record date nav ($)",
+        "% of fmv",
+        "% of fair value",
+        "% of nav",
+        "fmv",
+        "fair value",
+        "market value",
     ],
     "asset_class": [
         "asset class",
         "asset type",
         "primary asset class",
         "bucket",
+        "strategy",
     ],
     "security_type": [
         "security type",
@@ -419,6 +426,12 @@ def _detect_sheet_mode(header_df: pd.DataFrame, data_df: pd.DataFrame) -> str:
     )
     generic_ratio = generic_count / max(len(header_columns), 1)
 
+    # A first row whose labels match two or more known field names is a header
+    # row even if most data columns are text (e.g. name/strategy/geography
+    # tables), as long as nothing about it looks like a data row.
+    if match_count >= 2 and numeric_like_count == 0 and generic_ratio < 0.5:
+        return "header"
+
     if generic_ratio >= 0.5 or numeric_like_count > 0 or match_count == 0 or textish_columns >= max(len(header_columns) - 1, 1):
         return "data"
     return "header"
@@ -638,13 +651,28 @@ def _compute_fund_profile(
     working = df.copy()
     working["_nav"] = to_numeric_series(working[nav_col]).fillna(0.0)
     working = working[working["_nav"] > 0].copy()
+    if working.empty:
+        raise ValueError(
+            f"Mapped record date NAV column ('{nav_col}') has no positive numeric values — "
+            "check the fund's sheet, header mode, and column mapping"
+        )
+
+    name_col = _resolve_column(working, column_map.get("investment_name"))
+
+    # Drop total/subtotal rows (e.g. a bold "Total" line at 100%) so they don't
+    # double the NAV base or appear as the largest position.
+    if name_col:
+        def _is_total_label(value: Any) -> bool:
+            text = canonicalize_text(value)
+            return (text in {"total", "grand total", "subtotal"}
+                    or text.startswith("total ") or text.endswith(" total"))
+        working = working[~working[name_col].map(_is_total_label)].copy()
+
     working["_is_cash"] = working.apply(_is_cash_like_row, axis=1)
     invested = working[~working["_is_cash"]].copy()
     total_nav = float(invested["_nav"].sum())
     if total_nav <= 0:
         raise ValueError("Record date NAV column contains no positive numeric values")
-
-    name_col = _resolve_column(invested, column_map.get("investment_name"))
     aliases = alias_map or {}
     invested["_raw"] = invested.apply(lambda row: _position_label(row, name_col), axis=1)
     invested["_key"] = invested["_raw"].map(lambda r: _effective_key(r, aliases, split_set))

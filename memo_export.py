@@ -10,7 +10,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
-from native_charts import update_native_pies, parse_label_colors
+from native_charts import update_native_pies, parse_label_colors, update_cash_flow_profile_chart
 from fund_info import effective, fmt_money, fmt_ext
 
 
@@ -234,15 +234,16 @@ def _rebuild_concentration_table(table, result: Dict[str, Any]) -> None:
 
     fund_profiles = result.get("fund_profiles") or []
     top = result.get("top_concentration") or {}
+    project_name = result.get("_project_name") or "Total"
 
     headers = ["Top Positions", "Top 1", "Top 3", "Top 5", "Top 10", "Remaining"]
-    data_rows = [["Total", _fmt_pct(top.get("top_1", 0)), _fmt_pct(top.get("top_3", 0)),
+    data_rows = [[project_name, _fmt_pct(top.get("top_1", 0)), _fmt_pct(top.get("top_3", 0)),
                   _fmt_pct(top.get("top_5", 0)), _fmt_pct(top.get("top_10", 0)),
                   _fmt_pct(top.get("remaining", 0))]]
     for fp in fund_profiles:
         w = float(fp.get("weight") or 0)
         p = _compute_top_concentration(fp.get("position_exposure") or [], fund_weight=w)
-        data_rows.append([str(fp.get("fund_name") or "Fund"),
+        data_rows.append([str(fp.get("abbrev_name") or fp.get("fund_name") or "Fund"),
                           _fmt_pct(p["top_1"]), _fmt_pct(p["top_3"]),
                           _fmt_pct(p["top_5"]), _fmt_pct(p["top_10"]),
                           _fmt_pct(p["remaining"])])
@@ -353,7 +354,8 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
     total_w = sum(fund_weights) or 1.0
     fund_weight_pcts = [w / total_w for w in fund_weights]
     n_funds = len(fund_profiles)
-    fund_names = [str(fp.get("fund_name") or "Fund") for fp in fund_profiles]
+    fund_names = [str(fp.get("abbrev_name") or fp.get("fund_name") or "Fund") for fp in fund_profiles]
+    project_name = result.get("_project_name") or "Total"
 
     def fund_ac(fi: int, label: str) -> str:
         cats = (fund_profiles[fi].get("categories") or {}).get("asset_class", [])
@@ -369,7 +371,7 @@ def _rebuild_asset_type_table(table, result: Dict[str, Any]) -> None:
     # Row specs: (row_type, values)
     # row_type: "header" | "lpnav" | "ac_header" | "sub"
     specs: List[tuple] = []
-    specs.append(("header", ["Asset Class", "Sub-Asset Class", "Total"] + fund_names))
+    specs.append(("header", ["Asset Class", "Sub-Asset Class", project_name] + fund_names))
     specs.append(("lpnav",  ["LP NAV", "", "100%"] + [_fmt_pct0(w) for w in fund_weight_pcts]))
 
     present_acs = {_SEC_TO_AC.get(s, "") for s in sub_vals}
@@ -550,19 +552,140 @@ def _apply_exposure_tables(doc: Document, result: Dict[str, Any]) -> None:
 # Section registry
 # ---------------------------------------------------------------------------
 
-def _update_current_portfolio_names(doc: Document, result: Dict[str, Any],
-                                    project_name: str = "Project") -> None:
-    """Replace the bold company-name line in each Current Portfolio numbered entry
-    with the live exposure format: 'Name (X.X% ProjectName, X.X% Fund1, ...)'.
-    Finds entries by ilvl=0 List Paragraph paragraphs after the section heading.
-    Works even when content is inside tracked-change elements (<w:ins>/<w:moveTo>).
-    Updates the top 8 positions; skips paragraphs with no text content."""
+def _clear_paragraph_content(p_el) -> None:
+    """Remove all run/content children from a paragraph, keeping pPr (so its
+    numbering/formatting survives) and bookmarks."""
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    keep_tags = {f"{{{W}}}pPr", f"{{{W}}}bookmarkStart", f"{{{W}}}bookmarkEnd"}
+    for child in list(p_el):
+        if child.tag not in keep_tags:
+            p_el.remove(child)
+
+
+def _replace_paragraph_bold_text(p_el, new_text: str) -> None:
+    """Keep pPr + bookmarks, replace everything else with a single bold run."""
     from lxml import etree as _et
     W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     XML_SPACE = "http://www.w3.org/XML/1998/namespace"
+    _clear_paragraph_content(p_el)
+    r = _et.SubElement(p_el, f"{{{W}}}r")
+    rPr = _et.SubElement(r, f"{{{W}}}rPr")
+    _et.SubElement(rPr, f"{{{W}}}b")
+    rFonts = _et.SubElement(rPr, f"{{{W}}}rFonts")
+    rFonts.set(f"{{{W}}}ascii", "Calibri")
+    rFonts.set(f"{{{W}}}hAnsi", "Calibri")
+    sz = _et.SubElement(rPr, f"{{{W}}}sz"); sz.set(f"{{{W}}}val", "18")
+    t_el = _et.SubElement(r, f"{{{W}}}t")
+    t_el.text = new_text
+    t_el.set(f"{{{XML_SPACE}}}space", "preserve")
 
+
+def _collect_portfolio_slots(doc: Document) -> List[Dict[str, Any]]:
+    """Return the Current Portfolio section's entry slots in document order.
+    Each slot is {"header_p": <w:p> (ilvl=0), "child_ps": [<w:p>, ...] (ilvl 1/2
+    sub-bullets belonging to it), "has_narrative": bool (any child has text)}.
+    A slot runs from one ilvl=0 paragraph up to (not including) the next."""
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    slots: List[Dict[str, Any]] = []
+    in_section = False
+    current: Dict[str, Any] = None
+    for para in doc.paragraphs:
+        text = para.text
+        if not in_section:
+            if text.strip() == "Current Portfolio":
+                in_section = True
+            continue
+        if text.strip().startswith("Appendix"):
+            break
+
+        pPr = para._p.find(f"{{{W}}}pPr")
+        numPr = pPr.find(f"{{{W}}}numPr") if pPr is not None else None
+        ilvl = None
+        if numPr is not None:
+            ilvl_el = numPr.find(f"{{{W}}}ilvl")
+            ilvl = ilvl_el.get(f"{{{W}}}val") if ilvl_el is not None else None
+
+        if ilvl == "0":
+            if current is not None:
+                slots.append(current)
+            current = {"header_p": para._p, "child_ps": [], "has_narrative": False}
+        elif current is not None and ilvl in ("1", "2"):
+            current["child_ps"].append(para._p)
+            if text.strip():
+                current["has_narrative"] = True
+    if current is not None:
+        slots.append(current)
+    return slots
+
+
+def _real_slot_count(slots: List[Dict[str, Any]]) -> int:
+    """The template pads the section with unrelated blank ilvl=0 paragraphs
+    after the real, fully-structured entry slots. A real slot always carries
+    the full sub-bullet skeleton (Instruments Held / Investment / Company
+    Description / GCM Modeling); the padding paragraphs have none. So the
+    real slots are exactly the leading run with child_ps non-empty."""
+    n = 0
+    for s in slots:
+        if not s["child_ps"]:
+            break
+        n += 1
+    return n
+
+
+def _sync_current_portfolio_slots(doc: Document, target_n: int) -> List[Dict[str, Any]]:
+    """Grow or shrink the Current Portfolio section to exactly target_n
+    structured entry slots. Shrinking removes the trailing slot(s) entirely
+    (header + all sub-bullets), regardless of whether they already carry
+    hand-written narrative. Growing clones a blank slot's skeleton (preferring
+    one with no narrative, so new slots start empty) once per new slot needed.
+    Returns the resulting slots, in order."""
+    import copy
+    slots = _collect_portfolio_slots(doc)
+    n_real = _real_slot_count(slots)
+    real_slots = slots[:n_real]
+
+    if target_n < n_real:
+        for s in real_slots[target_n:]:
+            for p in s["child_ps"]:
+                p.getparent().remove(p)
+            s["header_p"].getparent().remove(s["header_p"])
+        real_slots = real_slots[:target_n]
+
+    elif target_n > n_real and real_slots:
+        blank = next((s for s in real_slots if not s["has_narrative"]), None)
+        proto = blank or real_slots[-1]
+        anchor = real_slots[-1]["child_ps"][-1] if real_slots[-1]["child_ps"] else real_slots[-1]["header_p"]
+        for _ in range(target_n - n_real):
+            new_header = copy.deepcopy(proto["header_p"])
+            if blank is None:
+                _clear_paragraph_content(new_header)
+            anchor.addnext(new_header)
+            anchor = new_header
+            new_children = []
+            for child in proto["child_ps"]:
+                new_child = copy.deepcopy(child)
+                if blank is None:
+                    _clear_paragraph_content(new_child)
+                anchor.addnext(new_child)
+                anchor = new_child
+                new_children.append(new_child)
+            real_slots.append({"header_p": new_header, "child_ps": new_children, "has_narrative": False})
+
+    return real_slots
+
+
+def _update_current_portfolio_names(doc: Document, result: Dict[str, Any],
+                                    project_name: str = "Project") -> None:
+    """Sync the Current Portfolio section to exactly N entry slots (N = the
+    project's configured portfolio_count, default 8 — the template's original
+    built-in slot count — capped to however many positions actually exist),
+    then set each slot's bold company-name line to the live exposure format:
+    'Name (X.X% ProjectName, X.X% Fund1, ...)', in top-position order."""
     fund_profiles = result.get("fund_profiles") or []
     top_positions = result.get("top_positions") or []
+
+    portfolio_count = result.get("_portfolio_count") or 8
+    target_n = min(int(portfolio_count), len(top_positions))
 
     # Per-fund position lookup: {(fund_idx, key): fund_level_%}
     fund_pos: Dict[tuple, float] = {}
@@ -588,55 +711,11 @@ def _update_current_portfolio_names(doc: Document, result: Dict[str, Any],
                 parts.append(f"{_fmt(fp_pct)} {abbrev}")
         return f"{name} ({', '.join(parts)})"
 
-    def _all_text(p_el) -> str:
-        return "".join(t.text or "" for t in p_el.iter() if t.tag == f"{{{W}}}t")
-
-    def _replace_content(p_el, new_text: str):
-        """Keep pPr + bookmarks, replace everything else with a single bold run."""
-        keep_tags = {f"{{{W}}}pPr", f"{{{W}}}bookmarkStart", f"{{{W}}}bookmarkEnd"}
-        for child in list(p_el):
-            if child.tag not in keep_tags:
-                p_el.remove(child)
-        r = _et.SubElement(p_el, f"{{{W}}}r")
-        rPr = _et.SubElement(r, f"{{{W}}}rPr")
-        _et.SubElement(rPr, f"{{{W}}}b")
-        rFonts = _et.SubElement(rPr, f"{{{W}}}rFonts")
-        rFonts.set(f"{{{W}}}ascii", "Calibri")
-        rFonts.set(f"{{{W}}}hAnsi", "Calibri")
-        sz = _et.SubElement(rPr, f"{{{W}}}sz"); sz.set(f"{{{W}}}val", "18")
-        t_el = _et.SubElement(r, f"{{{W}}}t")
-        t_el.text = new_text
-        t_el.set(f"{{{XML_SPACE}}}space", "preserve")
-
-    # Find Current Portfolio section
-    in_section = False
-    label_idx = 0
-    for para in doc.paragraphs:
-        if not in_section:
-            if "Current Portfolio" in para.text:
-                in_section = True
-            continue
-
-        if label_idx >= min(8, len(top_positions)):
+    real_slots = _sync_current_portfolio_slots(doc, target_n)
+    for i, slot in enumerate(real_slots):
+        if i >= len(top_positions):
             break
-
-        # Check for ilvl=0 (company entry paragraph)
-        pPr = para._p.find(f"{{{W}}}pPr")
-        if pPr is None:
-            continue
-        numPr = pPr.find(f"{{{W}}}numPr")
-        if numPr is None:
-            continue
-        ilvl_el = numPr.find(f"{{{W}}}ilvl")
-        if ilvl_el is None or ilvl_el.get(f"{{{W}}}val") != "0":
-            continue
-
-        # Skip truly empty paragraphs
-        if not _all_text(para._p).strip():
-            continue
-
-        _replace_content(para._p, _build_label(top_positions[label_idx]))
-        label_idx += 1
+        _replace_paragraph_bold_text(slot["header_p"], _build_label(top_positions[i]))
 
 
 def _update_fund_summary_table(doc: Document, result: Dict[str, Any]) -> None:
@@ -663,7 +742,13 @@ def _update_fund_summary_table(doc: Document, result: Dict[str, Any]) -> None:
     for tr in existing[n_funds:]:
         tbl.remove(tr)
     for _ in range(n_funds - len(existing)):
-        tbl.append(copy.deepcopy(header_tr))
+        new_tr = copy.deepcopy(header_tr)
+        # Strip the header's shading so cloned data rows render white, not blue.
+        for tc in new_tr.tc_lst:
+            if tc.tcPr is not None:
+                for shd in tc.tcPr.findall(qn("w:shd")):
+                    tc.tcPr.remove(shd)
+        tbl.append(new_tr)
 
     # Build and fill one row per fund
     any_perp = False
@@ -708,6 +793,11 @@ def _update_fund_summary_table(doc: Document, result: Dict[str, Any]) -> None:
             align = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
             _set_cell_text(row.cells[ci], val, align=align, font_pt=9)
             row.cells[ci].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            # Clear any inherited/pre-existing shading so data rows always render white.
+            tcPr = row.cells[ci]._tc.tcPr
+            if tcPr is not None:
+                for shd in tcPr.findall(qn("w:shd")):
+                    tcPr.remove(shd)
 
     _format_table(table, center_from_col=1, font_pt=9)
 
@@ -843,9 +933,10 @@ def _render_cashflow_table_image(cf_data: dict) -> bytes:
     cf_rows = cf_data.get("rows", [])
 
     # Colors matching typical Excel IC memo table styling
-    C_BASE  = "#FFC000"
-    C_BEAR  = "#2F75B6"
-    C_MGR   = "#1F4E79"
+    C_BASE  = "#E2EFDA"
+    C_BEAR  = "#FCE4D6"
+    C_MGR   = "#DDEBF7"
+    C_HDRFG = "#404040"
     C_DUR   = "#E2EFDA"
     C_TITLE = "#404040"
     C_ALT   = "#F2F2F2"
@@ -854,7 +945,7 @@ def _render_cashflow_table_image(cf_data: dict) -> bytes:
     def _pct(v):  return f"{float(v)*100:.1f}%" if v is not None else ""
     def _x(v):    return f"{float(v):.2f}x"     if v is not None else ""
     def _yrs(v):  return f"{float(v):.2f} Yrs"  if v is not None else ""
-    def _cf(v):   return f"{float(v):.2f}"       if v is not None else ""
+    def _cf(v):   return f"{float(v):.1f}"       if v is not None else ""
 
     # Build the ordered rows (type, label, [6 values])
     data_rows = [
@@ -863,7 +954,7 @@ def _render_cashflow_table_image(cf_data: dict) -> bytes:
         ("moic", "Net MOIC",      [_x(header.get(k))   for k in
             ("base_moic_sec","base_moic_fund","bear_moic_sec","bear_moic_fund","mgr_moic_sec","mgr_moic_fund")]),
         ("blank","",              ["", "", "", "", "", ""]),
-        ("dur",  "Duration (yrs)",[_yrs(header.get(k)) for k in
+        ("dur",  "WAL",           [_yrs(header.get(k)) for k in
             ("base_dur_sec","base_dur_fund","bear_dur_sec","bear_dur_fund","mgr_dur_sec","mgr_dur_fund")]),
     ]
     for row in cf_rows:
@@ -917,9 +1008,9 @@ def _render_cashflow_table_image(cf_data: dict) -> bytes:
     # Case header row (spans 2 value cols per case)
     y -= CASE_H
     cell(0, y, COL_W[0], CASE_H, C_GRAY)
-    cell(COL_X[1], y, COL_W[1] + COL_W[2], CASE_H, C_BASE, "BASE CASE",    fs=6, fg="white", bold=True)
-    cell(COL_X[3], y, COL_W[3] + COL_W[4], CASE_H, C_BEAR, "BEAR CASE",    fs=6, fg="white", bold=True)
-    cell(COL_X[5], y, COL_W[5] + COL_W[6], CASE_H, C_MGR,  "MANAGER CASE", fs=6, fg="white", bold=True)
+    cell(COL_X[1], y, COL_W[1] + COL_W[2], CASE_H, C_BASE, "BASE CASE",    fs=6, fg=C_HDRFG, bold=True)
+    cell(COL_X[3], y, COL_W[3] + COL_W[4], CASE_H, C_BEAR, "BEAR CASE",    fs=6, fg=C_HDRFG, bold=True)
+    cell(COL_X[5], y, COL_W[5] + COL_W[6], CASE_H, C_MGR,  "MANAGER CASE", fs=6, fg=C_HDRFG, bold=True)
 
     # S CFs / F CFs sub-headers
     y -= SCOL_H
@@ -928,7 +1019,7 @@ def _render_cashflow_table_image(cf_data: dict) -> bytes:
         [C_BASE, C_BASE, C_BEAR, C_BEAR, C_MGR, C_MGR],
         ["S CFs", "F CFs", "S CFs", "F CFs", "S CFs", "F CFs"]
     )):
-        cell(COL_X[ci + 1], y, COL_W[ci + 1], SCOL_H, cc, lbl, fs=5.5, fg="white", bold=True)
+        cell(COL_X[ci + 1], y, COL_W[ci + 1], SCOL_H, cc, lbl, fs=5.5, fg=C_HDRFG, bold=True)
 
     # Data rows
     for ri, (rtype, label, vals) in enumerate(data_rows):
@@ -1228,7 +1319,7 @@ def _apply_fund_returns_table(doc: Document, result: Dict[str, Any]) -> None:
     for ri, entry in enumerate(rows_data):
         row = table.rows[header_count + ri]
         _set_cell_text(row.cells[0], entry.get("name") or "",
-                       align=WD_ALIGN_PARAGRAPH.LEFT, font_pt=9)
+                       align=WD_ALIGN_PARAGRAPH.LEFT, font_pt=8)
         pairs = [
             _fmt_return_pair(entry.get("base_irr_sec"),  entry.get("base_moic_sec")),
             _fmt_return_pair(entry.get("base_irr_fund"), entry.get("base_moic_fund")),
@@ -1238,7 +1329,147 @@ def _apply_fund_returns_table(doc: Document, result: Dict[str, Any]) -> None:
             _fmt_return_pair(entry.get("mgr_irr_fund"),  entry.get("mgr_moic_fund")),
         ]
         for ci, val in enumerate(pairs):
-            _set_cell_text(row.cells[ci + 1], val, align=WD_ALIGN_PARAGRAPH.CENTER, font_pt=9)
+            _set_cell_text(row.cells[ci + 1], val, align=WD_ALIGN_PARAGRAPH.CENTER, font_pt=8)
+
+
+# ---------------------------------------------------------------------------
+# Effective Bid Price bridge table – values only, format untouched
+# ---------------------------------------------------------------------------
+
+# (result key, formatter) in the same fixed row order as model_reader.read_bid_bridge
+def _fmt_bridge_num(v: Optional[float]) -> str:
+    if v is None:
+        return "–"  # em dash
+    rounded = round(v, 1)
+    if rounded == 0:
+        return "–"
+    return f"({abs(rounded):.1f})" if rounded < 0 else f"{rounded:.1f}"
+
+
+def _fmt_bridge_pct(v: Optional[float]) -> str:
+    return _fmt_pct(v) if v is not None else "–"
+
+
+# "Known Dist" / "Known Contribs" are shown with whatever sign the model
+# itself stores — no flipping — so the memo matches the model exactly.
+_BID_BRIDGE_ROWS: List[tuple] = [
+    ("eff_bid",       _fmt_bridge_pct),
+    ("gross_bid",     _fmt_bridge_pct),
+    ("rd_nav",        _fmt_bridge_num),
+    ("sec_px",        _fmt_bridge_num),
+    ("eff_bid_nof",   _fmt_bridge_pct),
+    ("known_dist",    _fmt_bridge_num),
+    ("known_contrib", _fmt_bridge_num),
+    ("rd_nav_nof",    _fmt_bridge_num),
+    ("sec_px_nof",    _fmt_bridge_num),
+    ("eff_bid_nofp",  _fmt_bridge_pct),
+    ("mtm_since_rd",  _fmt_bridge_num),
+    ("rd_nav_nofp",   _fmt_bridge_num),
+    ("sec_px_nofp",   _fmt_bridge_num),
+]
+
+
+def _find_bid_bridge_table(doc: Document):
+    """Find the Effective Bid Price bridge table by its first data-row label."""
+    for t in doc.tables:
+        if len(t.rows) >= 2 and t.rows[1].cells[0].text.strip().lower() == "effective bid price":
+            return t
+    return None
+
+
+def _set_bridge_cell(cell, text: str) -> None:
+    """Write a bid-bridge value cell's text, preserving whatever run formatting
+    is already there (e.g. red/bold on a manually-flagged bid-price input row).
+    Only falls back to a fresh default-styled run when the cell is empty."""
+    p = cell.paragraphs[0]
+    if p.runs:
+        p.runs[0].text = text
+        for extra in p.runs[1:]:
+            extra._element.getparent().remove(extra._element)
+        for extra_p in cell.paragraphs[1:]:
+            extra_p._element.getparent().remove(extra_p._element)
+    else:
+        _set_cell_text(cell, text, align=WD_ALIGN_PARAGRAPH.CENTER, font_pt=8)
+
+
+def _sync_bid_bridge_columns(table, n_fund_cols_needed: int) -> None:
+    """Grow or shrink the table's fund columns (every column after the label
+    column and the combined column) to exactly n_fund_cols_needed. Shrinking
+    removes the rightmost fund column(s) — all-row tc's plus the matching
+    gridCol — so the surviving fund columns close up to the left. Growing
+    clones the rightmost existing fund column (formatting included) as a
+    prototype for each new column."""
+    import copy
+    from lxml import etree as _et
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    tbl = table._tbl
+    grid = tbl.find(f"{{{W}}}tblGrid")
+    grid_cols = grid.findall(f"{{{W}}}gridCol") if grid is not None else []
+    trs = tbl.findall(f"{{{W}}}tr")
+    n_fund_cols_current = len(table.rows[0].cells) - 2  # minus label + combined cols
+    if n_fund_cols_current < 0:
+        return
+
+    if n_fund_cols_needed < n_fund_cols_current:
+        for idx in range(2 + n_fund_cols_current - 1, 2 + n_fund_cols_needed - 1, -1):
+            if idx < len(grid_cols):
+                grid.remove(grid_cols[idx])
+            for tr in trs:
+                tcs = tr.findall(f"{{{W}}}tc")
+                if idx < len(tcs):
+                    tr.remove(tcs[idx])
+    elif n_fund_cols_needed > n_fund_cols_current:
+        proto_grid_col = grid_cols[-1] if grid_cols else None
+        for _ in range(n_fund_cols_needed - n_fund_cols_current):
+            if proto_grid_col is not None and grid is not None:
+                grid.append(copy.deepcopy(proto_grid_col))
+            for tr in trs:
+                tcs = tr.findall(f"{{{W}}}tc")
+                if tcs:
+                    tr.append(copy.deepcopy(tcs[-1]))
+
+
+def _apply_bid_bridge_table(doc: Document, result: Dict[str, Any]) -> None:
+    """Fill the Effective Bid Price bridge table (Balance (All) + one column
+    per included fund) with values read from the combined model. Header
+    titles follow the model's own column names (row 3). Funds map to columns
+    positionally, left to right, same order as they appear in the model.
+    Funds without Include? == 1 in the model are dropped entirely — their
+    memo column is removed (not just blanked) so the remaining fund columns
+    close up, matching the model's own left-to-right compaction."""
+    entries = result.get("_bid_bridge") or []
+    if not entries:
+        return
+    table = _find_bid_bridge_table(doc)
+    if table is None:
+        return
+
+    combined = entries[0]
+    included_funds = [f for f in entries[1:] if f.get("included")]
+
+    _sync_bid_bridge_columns(table, len(included_funds))
+
+    header_row = table.rows[0]
+    if len(header_row.cells) > 1:
+        _set_bridge_cell(header_row.cells[1], combined.get("name") or "")
+    for fi, fund in enumerate(included_funds):
+        ci = fi + 2
+        if ci >= len(header_row.cells):
+            break
+        _set_bridge_cell(header_row.cells[ci], fund.get("name") or "")
+
+    for ri, (key, fmt) in enumerate(_BID_BRIDGE_ROWS, start=1):
+        if ri >= len(table.rows):
+            break
+        row = table.rows[ri]
+        if len(row.cells) > 1:
+            _set_bridge_cell(row.cells[1], fmt(combined.get(key)))
+        for fi, fund in enumerate(included_funds):
+            ci = fi + 2
+            if ci >= len(row.cells):
+                break
+            _set_bridge_cell(row.cells[ci], fmt(fund.get(key)))
 
 
 SECTION_UPDATERS = {
@@ -1247,6 +1478,7 @@ SECTION_UPDATERS = {
     "fund_info": (_update_fund_summary_table, False),
     "model_outputs": (_apply_model_outputs, False),
     "fund_returns": (_apply_fund_returns_table, False),
+    "bid_bridge": (_apply_bid_bridge_table, False),
 }
 
 
@@ -1255,6 +1487,7 @@ def build_memo_export(project: Dict[str, Any], result: Dict[str, Any], output_pa
     doc = Document(str(template))
     result["_project_name"] = project.get("project_name") or "Project"
     result["_fund_infos"] = project.get("fund_infos") or {}
+    result["_portfolio_count"] = project.get("portfolio_count")
     _apply_exposure_tables(doc, result)
     _apply_portfolio_names(doc, result)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1272,6 +1505,7 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
     doc = Document(str(memo_path))
     result["_project_name"] = (project or {}).get("project_name") or "Project"
     result["_fund_infos"] = (project or {}).get("fund_infos") or {}
+    result["_portfolio_count"] = (project or {}).get("portfolio_count")
     refresh_pies = False
     for name in sections:
         updater = SECTION_UPDATERS.get(name)
@@ -1294,4 +1528,8 @@ def update_sections_in_file(memo_path, result: Dict[str, Any], sections=("exposu
         cf_data = result.get("_cashflows")
         if cf_data and cf_data.get("rows"):
             _replace_cashflow_image(memo_path, cf_data)
+    if "cash_flow_profile" in sections:
+        cfp_data = result.get("_cash_flow_profile") or {}
+        if cfp_data.get("rows"):
+            update_cash_flow_profile_chart(memo_path, cfp_data["rows"])
     return memo_path

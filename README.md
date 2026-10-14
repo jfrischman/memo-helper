@@ -36,6 +36,19 @@ The app works best when each fund workbook has one row per underlying investment
 - geography
 - sub-asset class
 
+## Which update button changes what
+
+See [docs/UPDATE_BUTTONS_GUIDE.md](docs/UPDATE_BUTTONS_GUIDE.md) for a plain-language
+walkthrough of each Update/Export button: what it changes in the memo, where that
+data comes from, and what needs to be in place before you click it.
+
+## Memo template mapping
+
+The exported Word memo's tables and charts are matched by fixed position or by
+scanning cell text, not by any tag in the document. See
+[docs/MEMO_TABLE_MAPPING.md](docs/MEMO_TABLE_MAPPING.md) for which `doc.tables[N]` /
+chart part maps to which section of the memo, and which function updates it.
+
 ## Notes
 
 - The app assumes the first row of the selected sheet is the header row.

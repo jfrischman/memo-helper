@@ -197,6 +197,12 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
     if cat_cache is None or val_cache is None:
         return xml_bytes, ["no cache nodes"]
 
+    # Whole-percent slice labels (23%, not 23.4%): the value labels take their
+    # format from the cached series formatCode.
+    fmt = val_cache.find("c:formatCode", NS)
+    if fmt is not None:
+        fmt.text = "0%"
+
     # Clear existing cat/val points
     for pt in list(cat_cache.findall("c:pt", NS)):
         cat_cache.remove(pt)
@@ -243,6 +249,14 @@ def _update_chart_xml(xml_bytes: bytes, items: Sequence[Dict[str, Any]],
         for ll in list(dlbls.findall("c:showLeaderLines", NS)):
             dlbls.remove(ll)
         etree.SubElement(dlbls, f"{{{C_NS}}}showLeaderLines").set("val", "0")
+        # Explicit whole-percent number format on the labels themselves, so
+        # they round with no decimal regardless of the template's format.
+        for nf in list(dlbls.findall("c:numFmt", NS)):
+            dlbls.remove(nf)
+        num_fmt = etree.Element(f"{{{C_NS}}}numFmt")
+        num_fmt.set("formatCode", "0%")
+        num_fmt.set("sourceLinked", "0")
+        dlbls.insert(0, num_fmt)
         # Default = white (unspecified categories stay white)
         for old_txPr in list(dlbls.findall("c:txPr", NS)):
             dlbls.remove(old_txPr)
@@ -398,6 +412,113 @@ def _build_chart_map_from_document(contents: Dict[str, bytes]) -> Dict[str, str]
             result[part] = FAMILY_ORDER[i]
 
     return result
+
+
+def _excel_serial(dt) -> float:
+    """Convert a datetime to an Excel date serial number (1900 date system)."""
+    from datetime import datetime as _dt
+    epoch = _dt(1899, 12, 30)
+    return float((dt - epoch).days)
+
+
+def _rebuild_numcache(cache_el: etree._Element, values: Sequence[Any]) -> None:
+    """Replace a <c:numCache>'s <c:pt> children to match `values` (by index;
+    None entries are simply omitted, leaving a gap at that category index)."""
+    for pt in list(cache_el.findall("c:pt", NS)):
+        cache_el.remove(pt)
+    pc = cache_el.find("c:ptCount", NS)
+    if pc is None:
+        pc = etree.SubElement(cache_el, f"{{{C_NS}}}ptCount")
+    pc.set("val", str(len(values)))
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        pt = etree.SubElement(cache_el, f"{{{C_NS}}}pt")
+        pt.set("idx", str(i))
+        vv = etree.SubElement(pt, f"{{{C_NS}}}v")
+        vv.text = repr(float(v))
+
+
+def _find_cash_flow_chart_parts(contents: Dict[str, bytes]) -> List[str]:
+    """Find every chart part with a 'Return of Capital' series — normally two
+    (the visible chart plus a duplicate copy), mirroring the pie-chart pattern."""
+    parts = []
+    for name, data in contents.items():
+        if not (name.startswith("word/charts/chart") and name.endswith(".xml")):
+            continue
+        try:
+            root = etree.fromstring(data)
+        except Exception:
+            continue
+        for v in root.iter(f"{{{C_NS}}}v"):
+            if v.text and "return of capital" in v.text.strip().lower():
+                parts.append(name)
+                break
+    return parts
+
+
+def _update_cash_flow_chart_xml(xml_bytes: bytes, rows: Sequence[Dict[str, Any]]) -> bytes:
+    """Rebuild the bar ('Return of Capital') and line ('MOIC') series' category
+    (date) and value caches to match `rows`, in place, leaving all styling
+    (colors, axis formatting, chart size) untouched."""
+    root = etree.fromstring(xml_bytes)
+    bar_ser = line_ser = None
+    for ser in root.findall(".//c:ser", NS):
+        tx_v = ser.find(".//c:tx//c:v", NS)
+        name = (tx_v.text or "").strip().lower() if tx_v is not None else ""
+        if "return of capital" in name:
+            bar_ser = ser
+        elif "moic" in name:
+            line_ser = ser
+
+    dates = [r.get("date") for r in rows]
+    date_serials = [_excel_serial(d) if d is not None else None for d in dates]
+    roc_vals = [r.get("roc") for r in rows]
+    moic_vals = [r.get("moic") for r in rows]
+
+    for ser, values in ((bar_ser, roc_vals), (line_ser, moic_vals)):
+        if ser is None:
+            continue
+        cat_cache = ser.find(".//c:cat//c:numCache", NS)
+        val_cache = ser.find(".//c:val//c:numCache", NS)
+        if cat_cache is not None:
+            _rebuild_numcache(cat_cache, date_serials)
+        if val_cache is not None:
+            _rebuild_numcache(val_cache, values)
+
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def update_cash_flow_profile_chart(docx_path, rows: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    """Update the Cash Flow Profile combo chart(s) (bar 'Return of Capital' +
+    line 'MOIC', sharing a date category axis) with rows read from the
+    combined model's Memo sheet via model_reader.read_cash_flow_profile.
+    Updates every matching chart part found (normally two)."""
+    docx_path = Path(docx_path)
+    if not rows:
+        return {"_none": "no rows to write"}
+
+    with zipfile.ZipFile(docx_path, "r") as zin:
+        names = zin.namelist()
+        contents = {name: zin.read(name) for name in names}
+
+    parts = _find_cash_flow_chart_parts(contents)
+    if not parts:
+        return {"_none": "no Cash Flow Profile chart found"}
+
+    report: Dict[str, str] = {}
+    for part in parts:
+        contents[part] = _update_cash_flow_chart_xml(contents[part], rows)
+        report[part] = f"{len(rows)} points"
+
+    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=str(docx_path.parent))
+    import os
+    os.close(tmp_fd)
+    with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name in names:
+            zout.writestr(name, contents[name])
+    shutil.move(tmp_name, docx_path)
+    return report
 
 
 def update_native_pies(docx_path, blend_categories: Dict[str, Sequence[Dict[str, Any]]],
